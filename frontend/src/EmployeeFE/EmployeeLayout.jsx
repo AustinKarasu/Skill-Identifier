@@ -148,7 +148,7 @@ export default function EmployeeLayout({ children }) {
         </div>
       )}
 
-      <div className="max-w-7xl mx-auto px-4 md:px-8 py-8 grid lg:grid-cols-[280px_minmax(0,1fr)] gap-6">
+      <div className="max-w-7xl mx-auto px-4 md:px-8 py-8 pb-24 lg:pb-8 grid lg:grid-cols-[280px_minmax(0,1fr)] gap-6">
         <aside className="space-y-4 hidden lg:block">
           <div className="rounded-3xl border border-white/10 bg-white/5 backdrop-blur-xl p-5">
             <p className="text-xs uppercase tracking-[0.22em] text-gray-500">Profile</p>
@@ -242,6 +242,25 @@ export default function EmployeeLayout({ children }) {
           </div>
         </div>
       )}
+
+      <nav className="fixed bottom-0 inset-x-0 z-40 lg:hidden border-t border-white/10 bg-black/90 backdrop-blur-xl">
+        <div className="grid grid-cols-4">
+          {items.map(({ to, label, icon: Icon }) => (
+            <NavLink key={to} to={to}>
+              {({ isActive }) => (
+                <div
+                  className={`flex flex-col items-center justify-center gap-1 px-2 py-2.5 text-[11px] transition-colors ${
+                    isActive ? 'text-white bg-white/10' : 'text-gray-400'
+                  }`}
+                >
+                  <Icon className={`w-4 h-4 ${isActive ? 'text-white' : 'text-gray-500'}`} />
+                  <span className="truncate max-w-full">{label.replace('Employee ', '').replace('Skill ', '')}</span>
+                </div>
+              )}
+            </NavLink>
+          ))}
+        </div>
+      </nav>
     </div>
   )
 }

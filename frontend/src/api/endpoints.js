@@ -32,9 +32,11 @@ export const API_ENDPOINTS = {
     workbench: '/manager/candidate-workbench',
     scheduleInterview: '/manager/interview-schedule',
     scheduleIcs: (id) => `/manager/interview-schedule/${id}/ics`,
+    scheduleDelete: (id) => `/manager/interview-schedule/${id}`,
     sendCommunication: '/manager/communications/send',
     enhanceCommunication: '/manager/communications/enhance',
     updateCandidateProfile: (id) => `/manager/candidates/${id}/profile`,
+    deleteCandidate: (id) => `/manager/candidates/${id}`,
   },
   employees: {
     list: '/employees',
@@ -54,6 +56,13 @@ export const API_ENDPOINTS = {
   roles: {
     list: '/roles',
     detail: (id) => `/roles/${id}`,
+  },
+  teams: {
+    list: '/teams',
+    detail: (id) => `/teams/${id}`,
+    members: (id) => `/teams/${id}/members`,
+    suggest: (id) => `/teams/${id}/suggest`,
+    applySuggestion: (id) => `/teams/${id}/apply-suggestion`,
   },
   rubrics: {
     list: '/rubrics',
@@ -83,6 +92,7 @@ export const API_ENDPOINTS = {
     interviewQuestions: '/employee/interview/questions',
     interviewSession: '/employee/interview/session',
     interviewChat: '/employee/interview/chat',
+    interviewProctoring: '/employee/interview/proctoring',
     interviewComplete: '/employee/interview/complete',
     assessments: '/employee/assessments',
     assessmentStart: (id) => `/employee/assessments/${id}/start`,

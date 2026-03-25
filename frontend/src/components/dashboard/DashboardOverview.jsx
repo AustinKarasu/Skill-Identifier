@@ -22,6 +22,15 @@ import { reportService } from '../../api/services/reportService'
 
 const CHART_COLORS = ['#60a5fa', '#34d399', '#f59e0b', '#f87171', '#a78bfa', '#22d3ee']
 
+const normalizeSignal = (value) => {
+  const raw = String(value || '').trim().toLowerCase()
+  if (raw.includes('strong')) return 'Strong'
+  if (raw.includes('potential') || raw.includes('promising')) return 'Promising'
+  if (raw.includes('excellent')) return 'Excellent'
+  if (raw.includes('need')) return 'Needs Development'
+  return 'Promising'
+}
+
 export default function DashboardOverview() {
   const [statsCards, setStatsCards] = useState([])
   const [skillGapData, setSkillGapData] = useState([])
@@ -75,16 +84,38 @@ export default function DashboardOverview() {
     }
   }, [])
 
-  const completedAssessments = useMemo(
-    () => assessments.filter((item) => item.status === 'completed' && Number(item.score) > 0),
-    [assessments]
-  )
+  const completedAssessments = useMemo(() => {
+    return assessments
+      .filter((item) => Number(item.score) > 0)
+      .map((item) => {
+        const perDomain = Array.isArray(item.perDomain)
+          ? item.perDomain.map((domain) => {
+              const score = Number(domain?.score) || 0
+              return {
+                title: domain?.title || domain?.domain || domain?.id || item.focusArea || 'General',
+                score,
+                gapLevel:
+                  String(domain?.gapLevel || '').trim() ||
+                  (score < 3 ? 'high' : score < 4 ? 'medium' : 'low'),
+              }
+            })
+          : []
+        return {
+          ...item,
+          perDomain,
+          hiringSignal: normalizeSignal(item.hiringSignal),
+        }
+      })
+  }, [assessments])
 
   const domainGapData = useMemo(() => {
     const map = new Map()
     for (const item of completedAssessments) {
-      for (const domain of item.perDomain || []) {
-        const key = domain.title || domain.id || 'Unknown'
+      const perDomain = Array.isArray(item.perDomain) && item.perDomain.length > 0
+        ? item.perDomain
+        : [{ title: item.focusArea || 'General', score: Number(item.score) || 0 }]
+      for (const domain of perDomain) {
+        const key = domain.title || domain.domain || domain.id || 'Unknown'
         const bucket = map.get(key) || { domain: key, totalGap: 0, count: 0 }
         const score = Number(domain.score) || 0
         bucket.totalGap += Math.max(0, 5 - score)
@@ -104,7 +135,7 @@ export default function DashboardOverview() {
   const hiringSignalData = useMemo(() => {
     const counts = { Excellent: 0, Strong: 0, Promising: 0, 'Needs Development': 0 }
     for (const item of completedAssessments) {
-      const signal = String(item.hiringSignal || 'Needs Development')
+      const signal = normalizeSignal(item.hiringSignal)
       if (!(signal in counts)) counts[signal] = 0
       counts[signal] += 1
     }
@@ -129,7 +160,13 @@ export default function DashboardOverview() {
       }
       entry.total += Number(item.score) || 0
       entry.count += 1
-      entry.highGapCount += (item.perDomain || []).filter((domain) => String(domain.gapLevel).toLowerCase() === 'high').length
+      const domainRows = Array.isArray(item.perDomain) && item.perDomain.length > 0
+        ? item.perDomain
+        : [{ score: Number(item.score) || 0, gapLevel: Number(item.score) < 3 ? 'high' : 'low' }]
+      entry.highGapCount += domainRows.filter((domain) => {
+        const gapLevel = String(domain.gapLevel || '').toLowerCase()
+        return gapLevel === 'high' || Number(domain.score) < 3
+      }).length
       map.set(key, entry)
     }
     return Array.from(map.values())
@@ -141,6 +178,27 @@ export default function DashboardOverview() {
       .sort((a, b) => a.avgScore - b.avgScore)
       .slice(0, 6)
   }, [completedAssessments])
+
+  const trendSeries = useMemo(() => {
+    const summaryRows = Array.isArray(reportSummary.trendData) ? reportSummary.trendData : []
+    if (summaryRows.length > 0) return summaryRows
+
+    const monthMap = new Map()
+    for (const item of completedAssessments) {
+      const month = String(item.date || '').slice(0, 7) || 'Unknown'
+      const bucket = monthMap.get(month) || { month, scores: [], completed: 0 }
+      bucket.scores.push(Number(item.score) || 0)
+      bucket.completed += 1
+      monthMap.set(month, bucket)
+    }
+    return Array.from(monthMap.values())
+      .sort((a, b) => String(a.month).localeCompare(String(b.month)))
+      .map((row) => ({
+        month: row.month,
+        avgScore: Number((row.scores.reduce((sum, value) => sum + value, 0) / Math.max(row.scores.length, 1)).toFixed(1)),
+        completed: row.completed,
+      }))
+  }, [completedAssessments, reportSummary.trendData])
 
   const chartBox = 'bg-gray-900 border border-gray-700 rounded-lg p-6 backdrop-blur-xl'
 
@@ -255,7 +313,7 @@ export default function DashboardOverview() {
       <motion.div initial={{ opacity: 0, y: 12 }} animate={{ opacity: 1, y: 0 }} className={chartBox}>
         <h3 className="text-lg font-bold text-white mb-6">Team Skill Trend (Monthly)</h3>
         <ResponsiveContainer width="100%" height={300}>
-          <LineChart data={reportSummary.trendData || []} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
+          <LineChart data={trendSeries} margin={{ top: 10, right: 20, left: 0, bottom: 10 }}>
             <CartesianGrid strokeDasharray="3 3" stroke="rgba(107, 114, 128, 0.2)" />
             <XAxis dataKey="month" stroke="#9ca3af" />
             <YAxis stroke="#9ca3af" />

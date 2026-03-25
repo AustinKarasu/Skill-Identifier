@@ -133,7 +133,7 @@ export default function EmployeeAssessments() {
 
         {result && (
           <div className="rounded-3xl border border-emerald-500/30 bg-emerald-500/10 p-5 text-emerald-200">
-            Assessment submitted. Score: {result.score.toFixed(1)}/5
+            Assessment submitted successfully.
           </div>
         )}
       </div>

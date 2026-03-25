@@ -14,6 +14,7 @@ import {
   ScrollText,
   Sliders,
   BookOpen,
+  Network,
   X,
 } from 'lucide-react'
 
@@ -69,6 +70,13 @@ export default function Sidebar({ isOpen = true, onNavigate }) {
       icon: CalendarDays,
       desc: 'Schedule & outreach',
       href: '/manager-ops',
+    },
+    {
+      id: 'teams',
+      label: 'Teams',
+      icon: Network,
+      desc: 'AI team builder',
+      href: '/teams',
     },
     {
       id: 'reports',

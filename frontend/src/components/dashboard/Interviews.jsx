@@ -75,9 +75,7 @@ export default function Interviews() {
     setStatus('')
     try {
       await assessmentService.deleteAssessment(selected.id)
-      setStatus('Interview log deleted.')
-      setSelectedId('')
-      await loadRows()
+      window.location.reload()
     } catch (deleteError) {
       setError(deleteError.message)
     } finally {

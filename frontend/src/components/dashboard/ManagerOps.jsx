@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion'
-import { CalendarDays, Download, ExternalLink, Mail, MessageCircle, PencilLine, RotateCcw, Save, Search, Send, Sparkles, UserRound, X } from 'lucide-react'
+import { CalendarDays, Download, ExternalLink, Mail, MessageCircle, PencilLine, RotateCcw, Save, Search, Send, Sparkles, Trash2, UserRound, X } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { managerOpsService } from '../../api/services/managerOpsService'
 
@@ -67,10 +67,12 @@ export default function ManagerOps() {
   })
   const [sending, setSending] = useState(false)
   const [scheduling, setScheduling] = useState(false)
+  const [deletingScheduleId, setDeletingScheduleId] = useState('')
   const [enhancing, setEnhancing] = useState(false)
   const [lastEnhancerSource, setLastEnhancerSource] = useState('')
   const [editing, setEditing] = useState(false)
   const [savingProfile, setSavingProfile] = useState(false)
+  const [deletingCandidate, setDeletingCandidate] = useState(false)
   const [editForm, setEditForm] = useState(buildEditDefaults(null))
 
   const loadWorkbench = async () => {
@@ -78,7 +80,12 @@ export default function ManagerOps() {
     try {
       const response = await managerOpsService.getWorkbench()
       setData(response)
-      setSelectedId((current) => current || response.candidates?.[0]?.employeeId || '')
+      setSelectedId((current) => {
+        const firstCandidateId = response.candidates?.[0]?.employeeId || ''
+        if (!current) return firstCandidateId
+        const stillExists = (response.candidates || []).some((candidate) => candidate.employeeId === current)
+        return stillExists ? current : firstCandidateId
+      })
       setError('')
     } catch (loadError) {
       setError(loadError.message)
@@ -116,6 +123,42 @@ export default function ManagerOps() {
     [data.candidates, filteredCandidates, selectedId]
   )
 
+  const managerDecisionLens = useMemo(() => {
+    if (!selectedCandidate) return []
+    const why = selectedCandidate.whyThisCandidate || {}
+    const matchScore = Number(selectedCandidate.jobMatch?.score || 0)
+    const interviewScore = Number(selectedCandidate.interview?.score || 0)
+    const readiness =
+      matchScore >= 80 && interviewScore >= 3.5
+        ? 'Strong hire signal'
+        : matchScore >= 65 || interviewScore >= 3
+          ? 'Promising with validation'
+          : 'Needs deeper evidence'
+
+    return [
+      {
+        label: 'Manager Decision',
+        value: readiness,
+        detail: `JD ${matchScore || 0}% - Interview ${interviewScore || 0}/5`,
+      },
+      {
+        label: 'Best Evidence',
+        value: (why.fitReasons || [])[0] || 'No fit reason captured yet.',
+        detail: 'Primary support signal',
+      },
+      {
+        label: 'Main Risk',
+        value: (why.concerns || [])[0] || 'No critical risk flagged yet.',
+        detail: 'Highest uncertainty to validate',
+      },
+      {
+        label: 'Next Manager Move',
+        value: (why.nextSteps || [])[0] || 'Schedule a structured follow-up interview.',
+        detail: 'Fastest path to decision',
+      },
+    ]
+  }, [selectedCandidate])
+
   useEffect(() => {
     if (!selectedCandidate) return
     setCompose(buildComposeDefaults(selectedCandidate, composeChannel))
@@ -139,6 +182,12 @@ export default function ManagerOps() {
     setCompose(buildComposeDefaults(selectedCandidate, composeChannel))
     setLastEnhancerSource('')
   }, [composeChannel, selectedCandidate])
+
+  useEffect(() => {
+    if (!status) return undefined
+    const timerId = window.setTimeout(() => setStatus(''), 4500)
+    return () => window.clearTimeout(timerId)
+  }, [status])
 
   const handleSendCommunication = async () => {
     if (!selectedCandidate || sending) return
@@ -281,6 +330,44 @@ export default function ManagerOps() {
     }
   }
 
+  const handleDeleteSchedule = async (schedule) => {
+    if (!schedule?.id || deletingScheduleId) return
+    const confirmed = window.confirm(`Delete scheduled interview "${schedule.title}"?`)
+    if (!confirmed) return
+    setDeletingScheduleId(schedule.id)
+    setError('')
+    setStatus('')
+    try {
+      await managerOpsService.deleteSchedule(schedule.id)
+      window.location.reload()
+    } catch (deleteError) {
+      setError(deleteError.message)
+    } finally {
+      setDeletingScheduleId('')
+    }
+  }
+
+  const handleDeleteCandidate = async () => {
+    if (!selectedCandidate || deletingCandidate) return
+    const label = selectedCandidate.candidateName || 'this candidate'
+    const confirmed = window.confirm(
+      `Delete ${label}? This will remove the candidate profile, assessments, schedules, and communication history. This action cannot be undone.`
+    )
+    if (!confirmed) return
+
+    setDeletingCandidate(true)
+    setError('')
+    setStatus('')
+    try {
+      await managerOpsService.deleteCandidate(selectedCandidate.employeeId)
+      window.location.reload()
+    } catch (deleteError) {
+      setError(deleteError.message)
+    } finally {
+      setDeletingCandidate(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <motion.div initial={{ opacity: 0, y: -8 }} animate={{ opacity: 1, y: 0 }} className="flex flex-col lg:flex-row lg:items-end lg:justify-between gap-4">
@@ -307,8 +394,8 @@ export default function ManagerOps() {
       {status && <div className="rounded-xl border border-emerald-500/30 bg-emerald-500/10 px-4 py-3 text-sm text-emerald-300">{status}</div>}
       {data.storage?.databaseMode && (
         <div className={`rounded-xl px-4 py-3 text-sm border ${data.storage.isRemoteDatabase ? 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200' : 'border-amber-500/30 bg-amber-500/10 text-amber-200'}`}>
-          Storage mode: <span className="font-semibold">{data.storage.databaseMode}</span> · Manager scheduling and communication data is persisted in <span className="font-semibold">{data.storage.persistence || 'backend storage'}</span>.
-          {!data.storage.isRemoteDatabase && ' Configure SUPABASE_DB_URL or DATABASE_URL to move this from local backend SQLite to a remote database.'}
+          Storage mode: <span className="font-semibold">{data.storage.databaseMode}</span> - Manager scheduling and communication data is persisted in <span className="font-semibold">{data.storage.persistence || 'backend storage'}</span>.
+          {!data.storage.isRemoteDatabase && ' Configure SUPABASE_DB_URL or DATABASE_URL to enforce remote database mode.'}
         </div>
       )}
 
@@ -398,7 +485,7 @@ export default function ManagerOps() {
                     <div>
                       <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Candidate command card</p>
                       <h2 className="text-3xl font-semibold text-white mt-2">{selectedCandidate.candidateName}</h2>
-                      <p className="text-sm text-gray-400 mt-2">{selectedCandidate.role || 'Role not set'} · {selectedCandidate.department || 'Department not set'}</p>
+                      <p className="text-sm text-gray-400 mt-2">{selectedCandidate.role || 'Role not set'} - {selectedCandidate.department || 'Department not set'}</p>
                       <div className="mt-3 flex flex-wrap gap-2 text-xs text-gray-300">
                         <span className="px-3 py-1.5 rounded-full border border-gray-700 bg-black/20">{selectedCandidate.contact?.email || 'No email'}</span>
                         <span className="px-3 py-1.5 rounded-full border border-gray-700 bg-black/20">{selectedCandidate.contact?.phone || 'No phone'}</span>
@@ -423,6 +510,15 @@ export default function ManagerOps() {
                       >
                         <PencilLine className="w-4 h-4" />
                         <span>Edit Candidate</span>
+                      </button>
+                      <button
+                        type="button"
+                        onClick={handleDeleteCandidate}
+                        disabled={deletingCandidate}
+                        className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 px-3 py-2 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-60"
+                      >
+                        <Trash2 className="w-4 h-4" />
+                        <span>{deletingCandidate ? 'Deleting...' : 'Delete Candidate'}</span>
                       </button>
                     </div>
                     <div className="grid grid-cols-2 gap-3 min-w-[280px]">
@@ -458,6 +554,20 @@ export default function ManagerOps() {
                       <div className={`mt-3 space-y-2 text-sm ${bodyClass}`}>
                         {items.map((item) => <p key={item}>{item}</p>)}
                       </div>
+                    </div>
+                  ))}
+                </div>
+              </div>
+
+              <div className="rounded-2xl border border-gray-700 bg-gray-900 p-5">
+                <h3 className="text-xl font-semibold text-white">Manager Decision Lens</h3>
+                <p className="mt-2 text-sm text-gray-400">Plain-language hiring snapshot so managers can decide quickly without reading every panel.</p>
+                <div className="mt-5 grid gap-4 md:grid-cols-2">
+                  {managerDecisionLens.map((item) => (
+                    <div key={item.label} className="rounded-xl border border-gray-700 bg-black/20 p-4">
+                      <p className="text-xs uppercase tracking-[0.2em] text-gray-500">{item.label}</p>
+                      <p className="mt-2 text-sm font-medium text-gray-100">{item.value}</p>
+                      <p className="mt-2 text-xs text-gray-500">{item.detail}</p>
                     </div>
                   ))}
                 </div>
@@ -511,7 +621,7 @@ export default function ManagerOps() {
                       {(selectedCandidate.schedules || []).slice(0, 5).map((schedule) => (
                         <div key={schedule.id} className="rounded-lg border border-gray-700 bg-gray-900/70 p-3">
                           <p className="font-medium text-white">{schedule.title}</p>
-                          <p className="text-sm text-gray-400 mt-1">{formatDateTime(schedule.startAt)} · {schedule.meetingMode}</p>
+                          <p className="text-sm text-gray-400 mt-1">{formatDateTime(schedule.startAt)} - {schedule.meetingMode}</p>
                           <p className="text-xs text-gray-500 mt-1">{schedule.location || 'Location pending'}</p>
                           <div className="flex flex-wrap gap-2 mt-3">
                             <a href={managerOpsService.getScheduleIcsUrl(schedule.id)} className="inline-flex items-center gap-2 rounded-lg border border-gray-700 px-3 py-2 text-sm text-gray-200 hover:bg-gray-800">
@@ -524,6 +634,15 @@ export default function ManagerOps() {
                                 <span>Google Calendar</span>
                               </a>
                             )}
+                            <button
+                              type="button"
+                              onClick={() => handleDeleteSchedule(schedule)}
+                              disabled={deletingScheduleId === schedule.id}
+                              className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 px-3 py-2 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-60"
+                            >
+                              <Trash2 className="w-4 h-4" />
+                              <span>{deletingScheduleId === schedule.id ? 'Deleting...' : 'Delete'}</span>
+                            </button>
                           </div>
                         </div>
                       ))}
@@ -584,7 +703,7 @@ export default function ManagerOps() {
                         <div key={item.id} className="rounded-lg border border-gray-700 bg-gray-900/70 p-3">
                           <div className="flex items-start justify-between gap-3">
                             <div>
-                              <p className="font-medium text-white">{item.channel === 'email' ? 'Email' : 'WhatsApp'} · {item.deliveryStatus}</p>
+                              <p className="font-medium text-white">{item.channel === 'email' ? 'Email' : 'WhatsApp'} - {item.deliveryStatus}</p>
                               <p className="text-xs text-gray-500 mt-1">{formatDateTime(item.createdAt)}</p>
                             </div>
                             {item.launchUrl && <a href={item.launchUrl} target="_blank" rel="noreferrer" className="text-xs text-gray-300 hover:text-white">Open</a>}
@@ -659,6 +778,15 @@ export default function ManagerOps() {
                 <span>Reset Changes</span>
               </button>
               <div className="flex flex-wrap gap-3">
+                <button
+                  type="button"
+                  onClick={handleDeleteCandidate}
+                  disabled={deletingCandidate}
+                  className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 px-4 py-2 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-60"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>{deletingCandidate ? 'Deleting...' : 'Delete Candidate'}</span>
+                </button>
                 <button
                   type="button"
                   onClick={() => setEditing(false)}

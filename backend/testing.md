@@ -7,7 +7,7 @@ Backend setup
 
 Notes
 
-- If `SUPABASE_DB_URL` is missing, the app falls back to a local SQLite database in `backend/app/data/local-dev.db`.
+- `SUPABASE_DB_URL` (or `DATABASE_URL`) is required. The backend is configured for remote Postgres only.
 - The API auto-creates tables on startup and seeds starter data the first time it runs.
 - Manager test login: `manager@company.com` / `manager123`
 - Employee test login: `employee@company.com` / `employee123` with `EMP-1001`

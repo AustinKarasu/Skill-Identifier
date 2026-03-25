@@ -227,6 +227,17 @@ export default function EmployeeOnboarding() {
           ? 'processing'
           : 'idle'
 
+  const genericResumeSummary = useMemo(() => {
+    const summary = String(resumeAnalysis?.summary || '').trim()
+    if (summary) return summary
+    return 'Generic resume upload complete. Skills were extracted, but role relevance is not yet ranked.'
+  }, [resumeAnalysis?.summary])
+
+  const genericSkillPreview = useMemo(() => {
+    const skills = Array.isArray(resumeAnalysis?.skills) ? resumeAnalysis.skills : []
+    return skills.slice(0, 5)
+  }, [resumeAnalysis?.skills])
+
   const handleReanalyze = async () => {
     if (!resume.fileName) return
     await runResumeAnalysis()
@@ -757,45 +768,85 @@ export default function EmployeeOnboarding() {
                 <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Recruiter Preview</p>
                 <h3 className="mt-4 text-2xl font-semibold text-white">Instant role-fit scoring</h3>
                 <p className="mt-3 text-sm leading-7 text-gray-400">
-                  Turn this into a stronger hackathon demo by showing how the same resume changes from a generic upload into a role-specific hiring brief.
+                  Upload any resume, then paste a role JD to transform the profile from generic extraction into a role-specific hiring brief with fit score, missing skills, and interview focus.
                 </p>
+                <div className="mt-5 grid gap-2 text-left text-xs text-gray-300">
+                  <p className="rounded-2xl border border-white/10 bg-black/30 px-3 py-2">1. Parse resume into skills, experience, and summary.</p>
+                  <p className="rounded-2xl border border-white/10 bg-black/30 px-3 py-2">2. Match the same resume against a target role.</p>
+                  <p className="rounded-2xl border border-white/10 bg-black/30 px-3 py-2">3. Generate manager-ready interview signals instantly.</p>
+                </div>
               </div>
             )}
           </div>
         </div>
 
         {jobMatchAnalysis && (
-          <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr]">
-            <div className="rounded-3xl border border-white/10 bg-black/20 p-5">
-              <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Interview Focus Areas</p>
-              {jobMatchAnalysis.interviewFocus?.length ? (
-                <div className="mt-4 space-y-3">
-                  {jobMatchAnalysis.interviewFocus.map((item, index) => (
-                    <div key={`${item}-${index}`} className="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-200">
-                      {item}
-                    </div>
-                  ))}
+          <>
+            <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr]">
+              <div className="rounded-3xl border border-white/10 bg-black/20 p-5">
+                <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Generic Resume Snapshot</p>
+                <p className="mt-3 text-sm leading-7 text-slate-200">{genericResumeSummary}</p>
+                <div className="mt-4 flex flex-wrap gap-2">
+                  {genericSkillPreview.length ? (
+                    genericSkillPreview.map((skill) => (
+                      <span key={skill} className="rounded-full border border-white/10 bg-slate-950/70 px-3 py-1 text-xs text-gray-200">
+                        {skill}
+                      </span>
+                    ))
+                  ) : (
+                    <span className="text-xs text-gray-500">Run resume analysis to display top extracted skills.</span>
+                  )}
                 </div>
-              ) : (
-                <p className="mt-3 text-sm text-gray-500">Focus areas will appear after analysis.</p>
-              )}
+              </div>
+
+              <div className="rounded-3xl border border-emerald-400/20 bg-emerald-500/10 p-5">
+                <p className="text-xs uppercase tracking-[0.2em] text-emerald-100/80">Role-Specific Hiring Brief</p>
+                <p className="mt-3 text-sm leading-7 text-slate-100">{jobMatchAnalysis.summary || 'Role match summary will appear here.'}</p>
+                <div className="mt-4 grid grid-cols-2 gap-3 text-xs text-slate-200">
+                  <div className="rounded-2xl border border-white/10 bg-slate-950/60 px-3 py-2">
+                    <p className="text-gray-400">Fit label</p>
+                    <p className="mt-1 font-semibold text-white">{jobMatchAnalysis.fitLabel || 'Pending'}</p>
+                  </div>
+                  <div className="rounded-2xl border border-white/10 bg-slate-950/60 px-3 py-2">
+                    <p className="text-gray-400">Manager next move</p>
+                    <p className="mt-1 font-semibold text-white">{jobMatchAnalysis.recommendedActions?.[0] || 'Gather one focused evidence check.'}</p>
+                  </div>
+                </div>
+              </div>
             </div>
 
-            <div className="rounded-3xl border border-white/10 bg-black/20 p-5">
-              <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Recommended Actions</p>
-              {jobMatchAnalysis.recommendedActions?.length ? (
-                <div className="mt-4 space-y-3">
-                  {jobMatchAnalysis.recommendedActions.map((item, index) => (
-                    <div key={`${item}-${index}`} className="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-200">
-                      {item}
-                    </div>
-                  ))}
-                </div>
-              ) : (
-                <p className="mt-3 text-sm text-gray-500">Actions will appear after analysis.</p>
-              )}
+            <div className="mt-5 grid gap-4 lg:grid-cols-[1fr_1fr]">
+              <div className="rounded-3xl border border-white/10 bg-black/20 p-5">
+                <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Interview Focus Areas</p>
+                {jobMatchAnalysis.interviewFocus?.length ? (
+                  <div className="mt-4 space-y-3">
+                    {jobMatchAnalysis.interviewFocus.map((item, index) => (
+                      <div key={`${item}-${index}`} className="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-200">
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-3 text-sm text-gray-500">Focus areas will appear after analysis.</p>
+                )}
+              </div>
+
+              <div className="rounded-3xl border border-white/10 bg-black/20 p-5">
+                <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Recommended Actions</p>
+                {jobMatchAnalysis.recommendedActions?.length ? (
+                  <div className="mt-4 space-y-3">
+                    {jobMatchAnalysis.recommendedActions.map((item, index) => (
+                      <div key={`${item}-${index}`} className="rounded-2xl border border-white/10 bg-slate-950/60 px-4 py-3 text-sm text-slate-200">
+                        {item}
+                      </div>
+                    ))}
+                  </div>
+                ) : (
+                  <p className="mt-3 text-sm text-gray-500">Actions will appear after analysis.</p>
+                )}
+              </div>
             </div>
-          </div>
+          </>
         )}
 
         {jobMatchAnalysis?.domainAlignment?.length ? (

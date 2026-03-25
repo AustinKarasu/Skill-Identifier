@@ -27,7 +27,7 @@ from fastapi.middleware.gzip import GZipMiddleware
 from fastapi.responses import Response
 from email.message import EmailMessage
 from email.utils import formataddr
-from sqlalchemy import select
+from sqlalchemy import func, select
 
 from .config import (
     GEMINI_API_KEY,
@@ -46,6 +46,7 @@ from .config import (
     SMTP_USER,
 )
 from .database import (
+    AppStateRecord,
     AssessmentRecord,
     AssessmentAttemptRecord,
     AssessmentTemplateRecord,
@@ -57,6 +58,7 @@ from .database import (
     RubricTemplateRecord,
     RoleRecord,
     SettingsRecord,
+    TeamRecord,
     UserRecord,
     db_session,
     dumps_json,
@@ -1188,6 +1190,12 @@ def cache_set(key: str, payload: Any) -> None:
 
 def cache_invalidate(*keys: str) -> None:
     for key in keys:
+        if key.endswith("*"):
+            prefix = key[:-1]
+            for cache_key in list(FAST_CACHE.keys()):
+                if cache_key.startswith(prefix):
+                    FAST_CACHE.pop(cache_key, None)
+            continue
         FAST_CACHE.pop(key, None)
 
 
@@ -1253,8 +1261,7 @@ def user_settings_state_key(user_id: str) -> str:
     return f"settings:{user_id}"
 
 
-def get_settings_for_user(session, user: UserRecord) -> dict[str, Any]:
-    stored = get_state(session, user_settings_state_key(user.id), {})
+def build_settings_payload_for_user(user: UserRecord, stored: dict[str, Any] | None = None) -> dict[str, Any]:
     if not isinstance(stored, dict):
         stored = {}
 
@@ -1265,7 +1272,7 @@ def get_settings_for_user(session, user: UserRecord) -> dict[str, Any]:
         "department": user.department or DEFAULT_SETTINGS["profile"].get("department", ""),
     }
 
-    settings_payload = {
+    return {
         "profile": {**profile_defaults, **(stored.get("profile", {}) if isinstance(stored.get("profile"), dict) else {})},
         "preferences": {**DEFAULT_SETTINGS["preferences"], **(stored.get("preferences", {}) if isinstance(stored.get("preferences"), dict) else {})},
         "localization": {**DEFAULT_SETTINGS["localization"], **(stored.get("localization", {}) if isinstance(stored.get("localization"), dict) else {})},
@@ -1274,7 +1281,11 @@ def get_settings_for_user(session, user: UserRecord) -> dict[str, Any]:
         "appearance": {**DEFAULT_SETTINGS["appearance"], **(stored.get("appearance", {}) if isinstance(stored.get("appearance"), dict) else {})},
         "updatedAt": stored.get("updatedAt", ""),
     }
-    return settings_payload
+
+
+def get_settings_for_user(session, user: UserRecord) -> dict[str, Any]:
+    stored = get_state(session, user_settings_state_key(user.id), {})
+    return build_settings_payload_for_user(user, stored if isinstance(stored, dict) else {})
 
 
 def normalize_settings_section_payload(section: str, payload: dict[str, Any]) -> dict[str, Any]:
@@ -1340,6 +1351,37 @@ def format_score_value(score: Any) -> str:
         return f"{float(score):.1f}"
     except (TypeError, ValueError):
         return "N/A"
+
+
+def sync_employee_record_status(
+    session,
+    user: UserRecord,
+    status: str,
+    *,
+    last_assessment: str | None = None,
+) -> None:
+    employee = session.scalar(select(EmployeeRecord).where(EmployeeRecord.email == user.email))
+    normalized_status = str(status or "pending").strip().lower()
+    if employee:
+        employee.status = normalized_status
+        if last_assessment:
+            employee.last_assessment = last_assessment
+        if not str(employee.name or "").strip():
+            employee.name = user.full_name or derive_name_from_email(user.email)
+        if not str(employee.role or "").strip():
+            employee.role = f"{user.department or 'General'} Specialist"
+        return
+    session.add(
+        EmployeeRecord(
+            name=user.full_name or derive_name_from_email(user.email),
+            email=user.email,
+            role=f"{user.department or 'General'} Specialist",
+            skills_json=dumps_json([]),
+            skill_level=0.0,
+            status=normalized_status,
+            last_assessment=last_assessment or "Never",
+        )
+    )
 
 
 def wants_inapp_notifications(session, user: UserRecord, category: str) -> bool:
@@ -1545,6 +1587,16 @@ def start_interview_chat_session(journey: dict[str, Any]) -> dict[str, Any]:
         "answers": [],
         "canComplete": False,
         "qualitySignals": {"turns": 0, "totalWords": 0},
+        "proctoring": {
+            "warningCount": 0,
+            "maxWarnings": 3,
+            "blocked": False,
+            "cancelled": False,
+            "lastPersonCount": 1,
+            "lastEventAt": "",
+            "lastManagerNoticeWarning": 0,
+            "events": [],
+        },
         "context": build_interview_context(journey),
         "createdAt": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime()),
     }
@@ -1950,19 +2002,217 @@ def serialize_employee(record: EmployeeRecord) -> dict[str, Any]:
     return {"id": record.id, "name": record.name, "email": record.email, "role": record.role, "skills": loads_json(record.skills_json, []), "skillLevel": record.skill_level, "status": record.status, "lastAssessment": record.last_assessment}
 
 
+def normalize_role_key(value: Any) -> str:
+    role_text = str(value or "").strip().lower()
+    return "".join(char for char in role_text if char.isalnum())
+
+
+def build_role_members(role_name: str, employees: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    expected_key = normalize_role_key(role_name)
+    if not expected_key:
+        return []
+    return [
+        {
+            "id": employee["id"],
+            "name": employee["name"],
+            "email": employee["email"],
+            "status": employee["status"],
+            "skillLevel": employee["skillLevel"],
+        }
+        for employee in employees
+        if normalize_role_key(employee.get("role")) == expected_key
+    ]
+
+
 def serialize_role(record: RoleRecord, members: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     member_list = members or []
     return {
         "id": record.id,
         "name": record.name,
         "requiredSkills": loads_json(record.required_skills_json, []),
-        "employees": len(member_list) if member_list else record.employees,
+        "employees": len(member_list),
         "members": member_list,
         "avgScore": record.avg_score,
         "readiness": record.readiness,
         "topGap": record.top_gap,
         "lastReview": record.last_review,
     }
+
+
+def normalize_team_required_skills(value: Any) -> list[str]:
+    if not isinstance(value, list):
+        return []
+    normalized: list[str] = []
+    for item in value:
+        if isinstance(item, dict):
+            name = str(item.get("name") or "").strip()
+        else:
+            name = str(item or "").strip()
+        if name:
+            normalized.append(name)
+    return list(dict.fromkeys(normalized))[:20]
+
+
+def parse_years_experience(value: Any) -> float:
+    raw = str(value or "").strip()
+    cleaned = "".join(char for char in raw if char.isdigit() or char == ".")
+    if cleaned.count(".") > 1:
+        cleaned = cleaned.replace(".", "", cleaned.count(".") - 1)
+    try:
+        years = float(cleaned)
+    except (TypeError, ValueError):
+        return 0.0
+    return max(0.0, min(25.0, years))
+
+
+def serialize_team(record: TeamRecord, employees_by_id: dict[int, dict[str, Any]] | None = None) -> dict[str, Any]:
+    required_skills = normalize_team_required_skills(loads_json(record.required_skills_json, []))
+    raw_member_ids = loads_json(record.member_employee_ids_json, [])
+    member_ids: list[int] = []
+    for item in raw_member_ids if isinstance(raw_member_ids, list) else []:
+        try:
+            parsed = int(item)
+        except (TypeError, ValueError):
+            continue
+        if parsed not in member_ids:
+            member_ids.append(parsed)
+
+    members: list[dict[str, Any]] = []
+    if employees_by_id:
+        for member_id in member_ids:
+            member = employees_by_id.get(member_id)
+            if member:
+                members.append(member)
+
+    return {
+        "id": record.id,
+        "name": record.name,
+        "roleFocus": record.role_focus,
+        "description": record.description,
+        "requiredSkills": required_skills,
+        "targetSize": int(record.target_size or 4),
+        "memberEmployeeIds": member_ids,
+        "members": members,
+        "createdAt": record.created_at,
+        "updatedAt": record.updated_at,
+    }
+
+
+def build_team_suggestions(session, team: TeamRecord) -> list[dict[str, Any]]:
+    employees = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.skill_level.desc())).all()]
+    if not employees:
+        return []
+
+    users = session.scalars(select(UserRecord).where(UserRecord.role == "employee")).all()
+    user_by_email = {str(user.email or "").strip().lower(): user for user in users}
+    user_ids = [user.id for user in users]
+    state_rows = (
+        session.scalars(select(AppStateRecord).where(AppStateRecord.state_key.in_([employee_journey_state_key(user_id) for user_id in user_ids])))
+        .all()
+        if user_ids
+        else []
+    )
+    journey_state = {row.state_key: loads_json(row.payload, {}) for row in state_rows}
+
+    assessment_rows = (
+        session.execute(
+            select(
+                AssessmentRecord.employee_id,
+                AssessmentRecord.date,
+                AssessmentRecord.selected_skills_json,
+                AssessmentRecord.gaps_json,
+            ).where(AssessmentRecord.employee_id.in_(user_ids))
+        ).all()
+        if user_ids
+        else []
+    )
+    latest_assessment: dict[str, dict[str, Any]] = {}
+    latest_assessment_sort_key: dict[str, tuple[float, str]] = {}
+    for row in assessment_rows:
+        employee_id = str(row.employee_id or "").strip()
+        if not employee_id:
+            continue
+        date_value = str(row.date or "").strip()
+        parsed = parse_iso_datetime(date_value)
+        sort_key = (parsed.timestamp() if parsed else 0.0, date_value)
+        previous = latest_assessment_sort_key.get(employee_id)
+        if previous is not None and sort_key <= previous:
+            continue
+        latest_assessment_sort_key[employee_id] = sort_key
+        latest_assessment[employee_id] = {
+            "skills": normalize_team_required_skills(loads_json(row.selected_skills_json, [])),
+            "gaps": normalize_team_required_skills(loads_json(row.gaps_json, [])),
+        }
+
+    required_skills = normalize_team_required_skills(loads_json(team.required_skills_json, []))
+    required_lower = {skill.lower(): skill for skill in required_skills}
+    fallback_target_size = int(team.target_size or 4) if int(team.target_size or 4) > 0 else 4
+    limit = max(2, min(12, fallback_target_size * 2))
+
+    suggestions: list[dict[str, Any]] = []
+    for employee in employees:
+        employee_email = str(employee.get("email") or "").strip().lower()
+        user = user_by_email.get(employee_email)
+        journey = journey_state.get(employee_journey_state_key(user.id), {}) if user else {}
+        profile = journey.get("profile", {}) if isinstance(journey.get("profile"), dict) else {}
+        resume_analysis = journey.get("resumeAnalysis", {}) if isinstance(journey.get("resumeAnalysis"), dict) else {}
+        job_match = journey.get("jobMatchAnalysis", {}) if isinstance(journey.get("jobMatchAnalysis"), dict) else {}
+        assessment = latest_assessment.get(user.id, {}) if user else {}
+
+        skill_pool = set()
+        for skill in normalize_team_required_skills(employee.get("skills", [])):
+            skill_pool.add(skill.lower())
+        for skill in normalize_team_required_skills(resume_analysis.get("skills", [])):
+            skill_pool.add(skill.lower())
+        for skill in normalize_team_required_skills(assessment.get("skills", [])):
+            skill_pool.add(skill.lower())
+
+        matched = [name for lower, name in required_lower.items() if lower in skill_pool]
+        missing = [name for lower, name in required_lower.items() if lower not in skill_pool]
+        skill_match_ratio = len(matched) / max(len(required_lower), 1) if required_lower else 0.5
+
+        skill_level = max(0.0, min(5.0, float(employee.get("skillLevel") or 0)))
+        level_ratio = skill_level / 5
+        years = parse_years_experience(profile.get("yearsExperience"))
+        years_ratio = min(years / 10.0, 1.0)
+        gap_count = len(normalize_team_required_skills(assessment.get("gaps", [])))
+        job_missing = len(normalize_team_required_skills(job_match.get("missingSkills", [])))
+        risk_penalty = min(gap_count + job_missing, 8) * 0.035
+        status = str(employee.get("status") or "").strip().lower()
+        status_boost = 0.06 if status == "active" else 0.0
+
+        fit_raw = (skill_match_ratio * 0.52) + (level_ratio * 0.28) + (years_ratio * 0.14) + status_boost - risk_penalty
+        fit_score = round(max(0.0, min(1.0, fit_raw)) * 100, 1)
+
+        rationale = []
+        if matched:
+            rationale.append(f"Matches key skills: {', '.join(matched[:4])}.")
+        if missing:
+            rationale.append(f"Needs coverage in: {', '.join(missing[:3])}.")
+        if years:
+            rationale.append(f"Experience signal: {years:g} years.")
+        if gap_count or job_missing:
+            rationale.append(f"Risk flags from gaps/missing evidence: {gap_count + job_missing}.")
+
+        suggestions.append(
+            {
+                "employeeId": employee.get("id"),
+                "name": employee.get("name"),
+                "email": employee.get("email"),
+                "role": employee.get("role"),
+                "status": status or "pending",
+                "skillLevel": round(skill_level, 1),
+                "experienceYears": years,
+                "fitScore": fit_score,
+                "matchedSkills": matched,
+                "missingSkills": missing,
+                "gapCount": gap_count + job_missing,
+                "rationale": rationale[:3],
+            }
+        )
+
+    suggestions.sort(key=lambda item: (float(item.get("fitScore") or 0), float(item.get("skillLevel") or 0)), reverse=True)
+    return suggestions[:limit]
 
 
 def serialize_assessment(record: AssessmentRecord) -> dict[str, Any]:
@@ -2436,7 +2686,27 @@ def build_dynamic_leaderboard(session) -> dict[str, Any]:
 
 def build_dynamic_dashboard(session) -> dict[str, Any]:
     employees = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord)).all()]
-    assessments = [serialize_assessment(item) for item in session.scalars(select(AssessmentRecord)).all()]
+    assessment_rows = session.execute(
+        select(
+            AssessmentRecord.status,
+            AssessmentRecord.score,
+            AssessmentRecord.selected_skills_json,
+            AssessmentRecord.date,
+            AssessmentRecord.employee,
+            AssessmentRecord.summary,
+        ).order_by(AssessmentRecord.date.desc())
+    ).all()
+    assessments = [
+        {
+            "status": row.status,
+            "score": float(row.score or 0),
+            "selectedSkills": loads_json(row.selected_skills_json, []),
+            "date": row.date or "",
+            "employee": row.employee or "Employee",
+            "summary": row.summary or "",
+        }
+        for row in assessment_rows
+    ]
     completed = [item for item in assessments if item["status"] == "completed" and item["score"]]
 
     avg_score = round(sum(item["score"] for item in completed) / max(len(completed), 1), 1)
@@ -3053,27 +3323,128 @@ def enhance_manager_message_with_ai(
 
 def build_manager_candidate_workbench(session) -> dict[str, Any]:
     employees = session.scalars(select(UserRecord).where(UserRecord.role == "employee").order_by(UserRecord.full_name)).all()
-    schedules = get_manager_interview_schedules(session)
-    communications = get_manager_communication_history(session)
-    assessments = [serialize_assessment(item) for item in session.scalars(select(AssessmentRecord)).all()]
+    if not employees:
+        return {
+            "generatedAt": datetime.now(UTC).isoformat(),
+            "storage": {
+                "databaseMode": get_database_mode(),
+                "isRemoteDatabase": get_database_mode() == "remote",
+                "persistence": "sql_tables",
+            },
+            "summary": {
+                "totalCandidates": 0,
+                "interviewReady": 0,
+                "strongMatches": 0,
+                "scheduled": 0,
+            },
+            "candidates": [],
+        }
 
+    employee_ids = [item.id for item in employees]
+    journey_keys = [employee_journey_state_key(employee_id) for employee_id in employee_ids]
+    settings_keys = [user_settings_state_key(employee_id) for employee_id in employee_ids]
+    state_rows = session.scalars(select(AppStateRecord).where(AppStateRecord.state_key.in_(["employeeJourney", *journey_keys, *settings_keys]))).all()
+    state_payload: dict[str, Any] = {row.state_key: loads_json(row.payload, {}) for row in state_rows}
+
+    legacy_journey = state_payload.get("employeeJourney", DEFAULT_EMPLOYEE_JOURNEY)
+    legacy_profile = legacy_journey.get("profile", {}) if isinstance(legacy_journey, dict) else {}
+    legacy_employee_id = str(legacy_profile.get("employeeId") or "").strip()
+
+    schedule_rows = session.scalars(
+        select(ManagerInterviewScheduleRecord)
+        .where(ManagerInterviewScheduleRecord.employee_id.in_(employee_ids))
+        .order_by(ManagerInterviewScheduleRecord.created_at.desc())
+    ).all()
+    schedules_by_employee: dict[str, list[dict[str, Any]]] = {}
+    for row in schedule_rows:
+        schedules_by_employee.setdefault(str(row.employee_id or ""), []).append(serialize_manager_schedule_record(row))
+
+    communication_rows = session.scalars(
+        select(ManagerCommunicationRecord)
+        .where(ManagerCommunicationRecord.employee_id.in_(employee_ids))
+        .order_by(ManagerCommunicationRecord.created_at.desc())
+    ).all()
+    communications_by_employee: dict[str, list[dict[str, Any]]] = {}
+    for row in communication_rows:
+        payload = serialize_manager_communication_record(row)
+        employee_id = str(payload.get("employeeId") or "")
+        bucket = communications_by_employee.setdefault(employee_id, [])
+        if len(bucket) < 8:
+            bucket.append(payload)
+
+    assessment_rows = session.execute(
+        select(
+            AssessmentRecord.id,
+            AssessmentRecord.title,
+            AssessmentRecord.employee,
+            AssessmentRecord.employee_id,
+            AssessmentRecord.status,
+            AssessmentRecord.score,
+            AssessmentRecord.date,
+            AssessmentRecord.duration,
+            AssessmentRecord.interviewer,
+            AssessmentRecord.focus_area,
+            AssessmentRecord.summary,
+            AssessmentRecord.per_domain_json,
+            AssessmentRecord.profile_json,
+            AssessmentRecord.strengths_json,
+            AssessmentRecord.gaps_json,
+            AssessmentRecord.recommendations_json,
+            AssessmentRecord.hiring_signal,
+            AssessmentRecord.confidence,
+            AssessmentRecord.evaluation_method,
+        ).where(AssessmentRecord.employee_id.in_(employee_ids))
+    ).all()
     latest_assessment_by_employee: dict[str, dict[str, Any]] = {}
-    for assessment in sorted(assessments, key=lambda row: str(row.get("date") or ""), reverse=True):
-        employee_id = str(assessment.get("employeeId") or "").strip()
-        if not employee_id or employee_id in latest_assessment_by_employee:
+    latest_assessment_sort_keys: dict[str, tuple[float, str]] = {}
+    for row in assessment_rows:
+        employee_id = str(row.employee_id or "").strip()
+        if not employee_id:
             continue
-        latest_assessment_by_employee[employee_id] = assessment
+        date_value = str(row.date or "").strip()
+        parsed = parse_iso_datetime(date_value)
+        sort_key = (parsed.timestamp() if parsed else 0.0, date_value)
+        previous_key = latest_assessment_sort_keys.get(employee_id)
+        if previous_key is not None and sort_key <= previous_key:
+            continue
+        latest_assessment_sort_keys[employee_id] = sort_key
+        latest_assessment_by_employee[employee_id] = {
+            "id": row.id,
+            "title": row.title,
+            "employee": row.employee,
+            "employeeId": employee_id,
+            "status": row.status,
+            "score": float(row.score or 0),
+            "date": date_value,
+            "duration": row.duration,
+            "interviewer": row.interviewer,
+            "focusArea": row.focus_area,
+            "summary": row.summary,
+            "perDomain": loads_json(row.per_domain_json, []),
+            "profile": loads_json(row.profile_json, {}),
+            "strengths": loads_json(row.strengths_json, []),
+            "gaps": loads_json(row.gaps_json, []),
+            "recommendations": loads_json(row.recommendations_json, []),
+            "hiringSignal": row.hiring_signal,
+            "confidence": row.confidence,
+            "evaluationMethod": row.evaluation_method,
+        }
 
     rows: list[dict[str, Any]] = []
     for employee in employees:
-        journey = get_employee_journey_for_user(session, employee.id)
+        journey = state_payload.get(employee_journey_state_key(employee.id), {})
+        if not isinstance(journey, dict) or not journey:
+            if isinstance(legacy_journey, dict) and legacy_employee_id == employee.id:
+                journey = legacy_journey
+            else:
+                journey = deepcopy(DEFAULT_EMPLOYEE_JOURNEY)
         profile = journey.get("profile", {}) if isinstance(journey.get("profile"), dict) else {}
         resume = journey.get("resume", {}) if isinstance(journey.get("resume"), dict) else {}
         resume_analysis = journey.get("resumeAnalysis", {}) if isinstance(journey.get("resumeAnalysis"), dict) else {}
         job_match = journey.get("jobMatchAnalysis", {}) if isinstance(journey.get("jobMatchAnalysis"), dict) else {}
         assessment = latest_assessment_by_employee.get(employee.id, {})
         assessment_profile = assessment.get("profile", {}) if isinstance(assessment.get("profile"), dict) else {}
-        employee_settings = get_settings_for_user(session, employee)
+        employee_settings = build_settings_payload_for_user(employee, state_payload.get(user_settings_state_key(employee.id), {}))
         settings_profile = employee_settings.get("profile", {}) if isinstance(employee_settings.get("profile"), dict) else {}
 
         candidate_name = str(profile.get("fullName") or employee.full_name or assessment.get("employee") or "Candidate").strip()
@@ -3116,8 +3487,8 @@ def build_manager_candidate_workbench(session) -> dict[str, Any]:
                 job_match=job_match,
                 latest_assessment=assessment,
             ),
-            "schedules": [serialize_manager_schedule(item) for item in schedules if str(item.get("employeeId") or "") == employee.id],
-            "communications": [item for item in communications if str(item.get("employeeId") or "") == employee.id][:8],
+            "schedules": schedules_by_employee.get(employee.id, []),
+            "communications": communications_by_employee.get(employee.id, []),
             "scheduleTemplateTitle": f"{role or 'Role'} manager interview",
         }
         row["templates"] = build_candidate_message_templates(row)
@@ -3148,11 +3519,19 @@ def build_manager_candidate_workbench(session) -> dict[str, Any]:
 
 
 app = FastAPI(title="SkillSenseAI API", version="2.0.0")
-raw_origins = os.getenv("CORS_ORIGINS", "http://127.0.0.1:5173,http://localhost:5173")
+raw_origins = os.getenv(
+    "CORS_ORIGINS",
+    "http://127.0.0.1:5173,http://localhost:5173,http://127.0.0.1:5175,http://localhost:5175",
+)
 cors_origins = [origin.strip() for origin in raw_origins.split(",") if origin.strip()]
 cors_origins = [origin for origin in cors_origins if origin != "*"]
 if not cors_origins:
-    cors_origins = ["http://127.0.0.1:5173", "http://localhost:5173"]
+    cors_origins = [
+        "http://127.0.0.1:5173",
+        "http://localhost:5173",
+        "http://127.0.0.1:5175",
+        "http://localhost:5175",
+    ]
 app.add_middleware(
     CORSMiddleware,
     allow_origins=cors_origins,
@@ -3179,6 +3558,14 @@ def startup_event() -> None:
             current_name = str(user.full_name or "").strip().lower()
             if not current_name or current_name == "employee account":
                 user.full_name = derive_name_from_email(user.email)
+        employees_payload = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.id)).all()]
+        cache_set("employees:list", employees_payload)
+        roles_payload = [
+            serialize_role(item, build_role_members(item.name, employees_payload))
+            for item in session.scalars(select(RoleRecord).order_by(RoleRecord.id)).all()
+        ]
+        cache_set("roles:list", roles_payload)
+        cache_set("dashboard:summary", build_dynamic_dashboard(session))
 
 
 @app.get("/")
@@ -3228,8 +3615,33 @@ def employee_login(payload: dict[str, Any], response: Response) -> dict[str, Any
     require_human_verification(payload)
     with db_session() as session:
         security = get_security_settings(session)
-        user = session.scalar(select(UserRecord).where(UserRecord.email == payload.get("email"), UserRecord.role == "employee", UserRecord.id == payload.get("employeeId")))
-        if not user or user.password_hash != hash_password(str(payload.get("password", ""))):
+        raw_email = str(payload.get("email", "")).strip()
+        email = raw_email.lower()
+        employee_id = str(payload.get("employeeId", "")).strip()
+        password_value = str(payload.get("password", "")).strip()
+
+        user = None
+        if email:
+            user = session.scalar(
+                select(UserRecord).where(
+                    UserRecord.role == "employee",
+                    func.lower(UserRecord.email) == email,
+                )
+            )
+            if user and employee_id and str(user.id).lower() != employee_id.lower():
+                raise HTTPException(
+                    status_code=401,
+                    detail=f"Employee ID does not match this email. Use {user.id}",
+                )
+        if not user and employee_id:
+            user = session.scalar(
+                select(UserRecord).where(
+                    UserRecord.role == "employee",
+                    func.lower(UserRecord.id) == employee_id.lower(),
+                )
+            )
+
+        if not user or user.password_hash != hash_password(password_value):
             raise HTTPException(status_code=401, detail="Invalid employee credentials")
         journey = get_employee_journey_for_user(session, user.id)
         journey_profile = journey.get("profile", {})
@@ -3538,7 +3950,7 @@ def update_settings(section: str, payload: dict[str, Any], authorization: str | 
 
 @app.get("/api/dashboard/summary")
 def get_dashboard_summary() -> dict[str, Any]:
-    cached = cache_get("dashboard:summary", ttl_seconds=8)
+    cached = cache_get("dashboard:summary", ttl_seconds=45)
     if cached is not None:
         return cached
     with db_session() as session:
@@ -3552,8 +3964,14 @@ def get_manager_candidate_workbench(authorization: str | None = Header(default=N
     user = resolve_user_from_auth(authorization)
     if not user or user.role != "manager":
         raise HTTPException(status_code=401, detail="Unauthorized")
+    cache_key = f"manager:workbench:{user.id}"
+    cached = cache_get(cache_key, ttl_seconds=20)
+    if cached is not None:
+        return cached
     with db_session() as session:
-        return build_manager_candidate_workbench(session)
+        payload = build_manager_candidate_workbench(session)
+        cache_set(cache_key, payload)
+        return payload
 
 
 @app.post("/api/manager/interview-schedule")
@@ -3704,6 +4122,7 @@ def create_manager_interview_schedule(payload: dict[str, Any], authorization: st
             "general",
         )
 
+        cache_invalidate("manager:workbench:*")
         return {
             "schedule": serialize_manager_schedule_record(schedule_record),
             "downloadPath": f"/api/manager/interview-schedule/{entry['id']}/ics",
@@ -3726,6 +4145,31 @@ def download_manager_schedule_ics(schedule_id: str, authorization: str | None = 
             media_type="text/calendar; charset=utf-8",
             headers={"Content-Disposition": f'attachment; filename="{schedule_id}.ics"'},
         )
+
+
+@app.delete("/api/manager/interview-schedule/{schedule_id}")
+def delete_manager_interview_schedule(schedule_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    if not user or user.role != "manager":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+    with db_session() as session:
+        schedule = session.get(ManagerInterviewScheduleRecord, schedule_id)
+        if not schedule:
+            raise HTTPException(status_code=404, detail="Scheduled event not found")
+        if str(schedule.manager_id or "").strip() and schedule.manager_id != user.id:
+            raise HTTPException(status_code=403, detail="Forbidden")
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="delete_interview_schedule",
+            target=schedule.candidate_name or schedule.employee_id,
+            meta={"scheduleId": schedule.id, "employeeId": schedule.employee_id, "title": schedule.title},
+        )
+        session.delete(schedule)
+    cache_invalidate("manager:workbench:*")
+    return {"success": True, "deletedScheduleId": schedule_id}
 
 
 @app.post("/api/manager/communications/send")
@@ -3802,6 +4246,7 @@ def send_manager_communication(payload: dict[str, Any], authorization: str | Non
             f"{user.full_name} sent you a {channel} update regarding your application.",
             "general",
         )
+        cache_invalidate("manager:workbench:*")
         return {"communication": record}
 
 
@@ -3884,16 +4329,79 @@ def update_manager_candidate_profile(employee_id: str, payload: dict[str, Any], 
             target=full_name or employee_id,
             meta={"employeeId": employee_id},
         )
-        cache_invalidate("resumes:index", "assessments:list", "dashboard:summary", "reports:summary")
+        cache_invalidate("resumes:index", "assessments:list", "dashboard:summary", "reports:summary", "manager:workbench:*")
 
         workbench = build_manager_candidate_workbench(session)
         candidate = next((item for item in workbench.get("candidates", []) if str(item.get("employeeId") or "") == employee_id), None)
         return {"candidate": candidate, "journey": journey}
 
 
+@app.delete("/api/manager/candidates/{employee_id}")
+def delete_manager_candidate(employee_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    if not user or user.role != "manager":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    with db_session() as session:
+        employee = session.get(UserRecord, employee_id)
+        if not employee or employee.role != "employee":
+            raise HTTPException(status_code=404, detail="Candidate not found")
+
+        candidate_name = str(employee.full_name or employee.email or employee_id).strip()
+        candidate_email = str(employee.email or "").strip()
+
+        for item in session.scalars(select(ManagerInterviewScheduleRecord).where(ManagerInterviewScheduleRecord.employee_id == employee_id)).all():
+            session.delete(item)
+        for item in session.scalars(select(ManagerCommunicationRecord).where(ManagerCommunicationRecord.employee_id == employee_id)).all():
+            session.delete(item)
+        for item in session.scalars(select(AssessmentRecord).where(AssessmentRecord.employee_id == employee_id)).all():
+            session.delete(item)
+        for item in session.scalars(select(AssessmentAttemptRecord).where(AssessmentAttemptRecord.employee_id == employee_id)).all():
+            session.delete(item)
+        for item in session.scalars(select(FeedbackSurveyRecord).where(FeedbackSurveyRecord.employee_id == employee_id)).all():
+            session.delete(item)
+        for item in session.scalars(select(NotificationRecord).where(NotificationRecord.user_id == employee_id)).all():
+            session.delete(item)
+
+        legacy_journey = get_state(session, "employeeJourney", DEFAULT_EMPLOYEE_JOURNEY)
+        if str((legacy_journey.get("profile") or {}).get("employeeId") or "").strip() == employee_id:
+            set_state(session, "employeeJourney", DEFAULT_EMPLOYEE_JOURNEY)
+        set_state(session, employee_journey_state_key(employee_id), {})
+        set_state(session, user_settings_state_key(employee_id), {})
+        set_state(session, f"totp:{employee_id}", {"enabled": False, "secret": ""})
+
+        for token, details in list(ACTIVE_SESSIONS.items()):
+            if details.get("userId") == employee_id:
+                ACTIVE_SESSIONS.pop(token, None)
+
+        session.delete(employee)
+
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="manager_delete_candidate",
+            target=candidate_name,
+            meta={"employeeId": employee_id, "email": candidate_email},
+        )
+
+    cache_invalidate(
+        "resumes:index",
+        "assessments:list",
+        "dashboard:summary",
+        "reports:summary",
+        "leaderboard:summary",
+        "manager:workbench:*",
+        "teams:list",
+        f"notifications:list:{employee_id}",
+    )
+    return {"success": True, "deletedCandidateId": employee_id}
+
+
 @app.get("/api/employees")
 def get_employees() -> list[dict[str, Any]]:
-    cached = cache_get("employees:list", ttl_seconds=5)
+    cached = cache_get("employees:list", ttl_seconds=30)
     if cached is not None:
         return cached
     with db_session() as session:
@@ -3915,7 +4423,7 @@ def create_employee(payload: dict[str, Any]) -> list[dict[str, Any]]:
             target=str(payload.get("email", "")),
             meta={"role": payload.get("role", "")},
         )
-    cache_invalidate("employees:list", "roles:list", "dashboard:summary")
+    cache_invalidate("employees:list", "roles:list", "dashboard:summary", "manager:workbench:*", "teams:list")
     return get_employees()
 
 
@@ -3941,7 +4449,7 @@ def update_employee(employee_id: int, payload: dict[str, Any]) -> list[dict[str,
             target=f"{item.name} ({item.email})",
             meta={"status": item.status, "role": item.role},
         )
-    cache_invalidate("employees:list", "roles:list", "dashboard:summary")
+    cache_invalidate("employees:list", "roles:list", "dashboard:summary", "manager:workbench:*", "teams:list")
     return get_employees()
 
 
@@ -3960,13 +4468,13 @@ def delete_employee(employee_id: int) -> list[dict[str, Any]]:
             target=f"{item.name} ({item.email})",
         )
         session.delete(item)
-    cache_invalidate("employees:list", "roles:list", "dashboard:summary")
+    cache_invalidate("employees:list", "roles:list", "dashboard:summary", "manager:workbench:*", "teams:list")
     return get_employees()
 
 
 @app.get("/api/roles")
 def get_roles() -> list[dict[str, Any]]:
-    cached = cache_get("roles:list", ttl_seconds=8)
+    cached = cache_get("roles:list", ttl_seconds=30)
     if cached is not None:
         return cached
     with db_session() as session:
@@ -3974,11 +4482,7 @@ def get_roles() -> list[dict[str, Any]]:
         payload = [
             serialize_role(
                 item,
-                [
-                    {"id": employee["id"], "name": employee["name"], "email": employee["email"], "status": employee["status"], "skillLevel": employee["skillLevel"]}
-                    for employee in employees
-                    if employee["role"] == item.name
-                ],
+                build_role_members(item.name, employees),
             )
             for item in session.scalars(select(RoleRecord).order_by(RoleRecord.id)).all()
         ]
@@ -3993,11 +4497,7 @@ def get_role(role_id: int) -> dict[str, Any]:
         if not item:
             raise HTTPException(status_code=404, detail="Role not found")
         employees = [serialize_employee(row) for row in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.id)).all()]
-        members = [
-            {"id": employee["id"], "name": employee["name"], "email": employee["email"], "status": employee["status"], "skillLevel": employee["skillLevel"]}
-            for employee in employees
-            if employee["role"] == item.name
-        ]
+        members = build_role_members(item.name, employees)
         return serialize_role(item, members)
 
 
@@ -4013,7 +4513,7 @@ def create_role(payload: dict[str, Any]) -> list[dict[str, Any]]:
             action="create_role",
             target=str(payload.get("name", "")),
         )
-    cache_invalidate("roles:list", "dashboard:summary")
+    cache_invalidate("roles:list", "dashboard:summary", "manager:workbench:*")
     return get_roles()
 
 
@@ -4039,7 +4539,7 @@ def update_role(role_id: int, payload: dict[str, Any]) -> list[dict[str, Any]]:
             target=item.name,
             meta={"readiness": item.readiness},
         )
-    cache_invalidate("roles:list", "dashboard:summary")
+    cache_invalidate("roles:list", "dashboard:summary", "manager:workbench:*")
     return get_roles()
 
 
@@ -4058,8 +4558,197 @@ def delete_role(role_id: int) -> list[dict[str, Any]]:
             target=item.name,
         )
         session.delete(item)
-    cache_invalidate("roles:list", "dashboard:summary")
+    cache_invalidate("roles:list", "dashboard:summary", "manager:workbench:*")
     return get_roles()
+
+
+@app.get("/api/teams")
+def get_teams(authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    cached = cache_get("teams:list", ttl_seconds=20)
+    if cached is not None:
+        return cached
+    with db_session() as session:
+        employees = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.name)).all()]
+        employees_by_id = {int(item["id"]): item for item in employees}
+        payload = [serialize_team(item, employees_by_id) for item in session.scalars(select(TeamRecord).order_by(TeamRecord.id.asc())).all()]
+        cache_set("teams:list", payload)
+        return payload
+
+
+@app.post("/api/teams")
+def create_team(payload: dict[str, Any], authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    name = str(payload.get("name") or "").strip()
+    if not name:
+        raise HTTPException(status_code=400, detail="Team name is required")
+    now_iso = datetime.now(UTC).isoformat()
+    with db_session() as session:
+        team = TeamRecord(
+            name=name,
+            role_focus=str(payload.get("roleFocus") or "").strip(),
+            description=str(payload.get("description") or "").strip(),
+            required_skills_json=dumps_json(normalize_team_required_skills(payload.get("requiredSkills"))),
+            member_employee_ids_json=dumps_json([int(item) for item in payload.get("memberEmployeeIds", []) if str(item).isdigit()]),
+            target_size=max(2, min(12, int(payload.get("targetSize") or 4))),
+            created_at=now_iso,
+            updated_at=now_iso,
+        )
+        session.add(team)
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="create_team",
+            target=name,
+            meta={"roleFocus": team.role_focus, "targetSize": team.target_size},
+        )
+    cache_invalidate("teams:list")
+    return get_teams(authorization)
+
+
+@app.put("/api/teams/{team_id}")
+def update_team(team_id: int, payload: dict[str, Any], authorization: str | None = Header(default=None)) -> list[dict[str, Any]]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    with db_session() as session:
+        team = session.get(TeamRecord, team_id)
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+
+        if "name" in payload:
+            next_name = str(payload.get("name") or "").strip()
+            if not next_name:
+                raise HTTPException(status_code=400, detail="Team name is required")
+            team.name = next_name
+        if "roleFocus" in payload:
+            team.role_focus = str(payload.get("roleFocus") or "").strip()
+        if "description" in payload:
+            team.description = str(payload.get("description") or "").strip()
+        if "requiredSkills" in payload:
+            team.required_skills_json = dumps_json(normalize_team_required_skills(payload.get("requiredSkills")))
+        if "memberEmployeeIds" in payload:
+            team.member_employee_ids_json = dumps_json([int(item) for item in payload.get("memberEmployeeIds", []) if str(item).isdigit()])
+        if "targetSize" in payload:
+            team.target_size = max(2, min(12, int(payload.get("targetSize") or 4)))
+        team.updated_at = datetime.now(UTC).isoformat()
+
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="update_team",
+            target=team.name,
+            meta={"teamId": team.id},
+        )
+    cache_invalidate("teams:list")
+    return get_teams(authorization)
+
+
+@app.delete("/api/teams/{team_id}")
+def delete_team(team_id: int, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    with db_session() as session:
+        team = session.get(TeamRecord, team_id)
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="delete_team",
+            target=team.name,
+            meta={"teamId": team.id},
+        )
+        session.delete(team)
+    cache_invalidate("teams:list")
+    return {"success": True, "deletedTeamId": team_id}
+
+
+@app.post("/api/teams/{team_id}/members")
+def update_team_member(team_id: int, payload: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    member_id_raw = payload.get("employeeId")
+    if member_id_raw is None:
+        raise HTTPException(status_code=400, detail="Employee ID is required")
+    try:
+        member_id = int(member_id_raw)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(status_code=400, detail="Invalid employee ID") from exc
+    action = str(payload.get("action") or "add").strip().lower()
+    if action not in {"add", "remove"}:
+        raise HTTPException(status_code=400, detail="Action must be add or remove")
+
+    with db_session() as session:
+        team = session.get(TeamRecord, team_id)
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+        member_ids = [int(item) for item in loads_json(team.member_employee_ids_json, []) if str(item).isdigit()]
+        if action == "add" and member_id not in member_ids:
+            member_ids.append(member_id)
+        if action == "remove":
+            member_ids = [item for item in member_ids if item != member_id]
+        team.member_employee_ids_json = dumps_json(member_ids)
+        team.updated_at = datetime.now(UTC).isoformat()
+        employees = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.name)).all()]
+        employees_by_id = {int(item["id"]): item for item in employees}
+        serialized = serialize_team(team, employees_by_id)
+    cache_invalidate("teams:list")
+    return serialized
+
+
+@app.post("/api/teams/{team_id}/suggest")
+def suggest_team_members(team_id: int, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    with db_session() as session:
+        team = session.get(TeamRecord, team_id)
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+        employees = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.name)).all()]
+        employees_by_id = {int(item["id"]): item for item in employees}
+        suggestions = build_team_suggestions(session, team)
+        return {
+            "team": serialize_team(team, employees_by_id),
+            "suggestions": suggestions,
+            "method": "ai-heuristic",
+            "generatedAt": datetime.now(UTC).isoformat(),
+        }
+
+
+@app.post("/api/teams/{team_id}/apply-suggestion")
+def apply_team_suggestion(team_id: int, payload: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    raw_ids = payload.get("employeeIds", [])
+    member_ids = [int(item) for item in raw_ids if str(item).isdigit()]
+    with db_session() as session:
+        team = session.get(TeamRecord, team_id)
+        if not team:
+            raise HTTPException(status_code=404, detail="Team not found")
+        team.member_employee_ids_json = dumps_json(member_ids)
+        team.updated_at = datetime.now(UTC).isoformat()
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="apply_team_suggestion",
+            target=team.name,
+            meta={"teamId": team.id, "memberCount": len(member_ids)},
+        )
+        employees = [serialize_employee(item) for item in session.scalars(select(EmployeeRecord).order_by(EmployeeRecord.name)).all()]
+        employees_by_id = {int(item["id"]): item for item in employees}
+        serialized = serialize_team(team, employees_by_id)
+    cache_invalidate("teams:list")
+    return {"team": serialized, "appliedCount": len(member_ids)}
 
 
 @app.get("/api/rubrics")
@@ -4198,7 +4887,7 @@ def delete_assessment_template(template_id: int, authorization: str | None = Hea
 
 @app.get("/api/assessments")
 def get_assessments() -> list[dict[str, Any]]:
-    cached = cache_get("assessments:list", ttl_seconds=5)
+    cached = cache_get("assessments:list", ttl_seconds=20)
     if cached is not None:
         return cached
     with db_session() as session:
@@ -4230,6 +4919,57 @@ def get_assessment_detail(assessment_id: str, authorization: str | None = Header
 def require_manager(user: UserRecord | None) -> None:
     if not user or user.role != "manager":
         raise HTTPException(status_code=401, detail="Unauthorized")
+
+
+@app.put("/api/assessments/{assessment_id}")
+def update_assessment(
+    assessment_id: str,
+    payload: dict[str, Any],
+    authorization: str | None = Header(default=None),
+) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
+    with db_session() as session:
+        item = session.get(AssessmentRecord, assessment_id)
+        if not item:
+            raise HTTPException(status_code=404, detail="Assessment not found")
+
+        if "title" in payload:
+            item.title = str(payload.get("title") or item.title).strip() or item.title
+        if "status" in payload:
+            status = str(payload.get("status") or "").strip().lower()
+            if status in {"pending", "in-progress", "completed", "submitted"}:
+                item.status = status
+        if "summary" in payload:
+            summary = str(payload.get("summary") or "").strip()
+            if summary:
+                item.summary = summary
+        if "focusArea" in payload:
+            item.focus_area = str(payload.get("focusArea") or item.focus_area).strip() or item.focus_area
+        if "duration" in payload:
+            item.duration = str(payload.get("duration") or item.duration).strip() or item.duration
+        if "hiringSignal" in payload:
+            item.hiring_signal = str(payload.get("hiringSignal") or item.hiring_signal).strip() or item.hiring_signal
+        if "confidence" in payload:
+            item.confidence = str(payload.get("confidence") or item.confidence).strip() or item.confidence
+        if "score" in payload:
+            try:
+                next_score = float(payload.get("score"))
+            except (TypeError, ValueError) as exc:
+                raise HTTPException(status_code=400, detail="Score must be a number between 0 and 5") from exc
+            item.score = max(0.0, min(5.0, next_score))
+
+        append_audit_log(
+            session,
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
+            action="update_assessment",
+            target=f"{item.title} - {item.employee}",
+            meta={"assessmentId": assessment_id},
+        )
+        cache_invalidate("assessments:list", "reports:summary", "leaderboard:summary", "dashboard:summary", "manager:workbench:*")
+        return serialize_assessment(item)
 
 
 @app.get("/api/assessments/{assessment_id}/pdf")
@@ -4297,22 +5037,34 @@ def download_shared_assessment_pdf(token: str) -> Response:
 
 
 @app.delete("/api/assessments/{assessment_id}")
-def delete_assessment(assessment_id: str) -> dict[str, Any]:
+def delete_assessment(assessment_id: str, authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    require_manager(user)
     with db_session() as session:
         item = session.get(AssessmentRecord, assessment_id)
         if not item:
             raise HTTPException(status_code=404, detail="Assessment not found")
         append_audit_log(
             session,
-            actor_id=None,
-            actor_role="manager",
-            actor_name="Manager",
+            actor_id=user.id,
+            actor_role=user.role,
+            actor_name=user.full_name,
             action="delete_assessment",
             target=f"{item.title} - {item.employee}",
             meta={"assessmentId": assessment_id},
         )
         session.delete(item)
-        cache_invalidate("assessments:list", "reports:summary", "leaderboard:summary", "dashboard:summary", "resumes:index")
+        cache_invalidate(
+            "assessments:list",
+            "reports:summary",
+            "leaderboard:summary",
+            "dashboard:summary",
+            "resumes:index",
+            "employees:list",
+            "roles:list",
+            "manager:workbench:*",
+            "teams:list",
+        )
         return {"success": True, "deletedId": assessment_id}
 
 
@@ -4378,7 +5130,7 @@ def update_interview_retention(payload: dict[str, Any]) -> dict[str, Any]:
 
 @app.get("/api/reports")
 def get_reports(authorization: str | None = Header(default=None)) -> dict[str, Any]:
-    cached = cache_get("reports:summary", ttl_seconds=10)
+    cached = cache_get("reports:summary", ttl_seconds=30)
     if cached is not None:
         return cached
     user = resolve_user_from_auth(authorization)
@@ -4394,7 +5146,7 @@ def get_reports(authorization: str | None = Header(default=None)) -> dict[str, A
 
 @app.get("/api/leaderboard")
 def get_leaderboard() -> dict[str, Any]:
-    cached = cache_get("leaderboard:summary", ttl_seconds=10)
+    cached = cache_get("leaderboard:summary", ttl_seconds=30)
     if cached is not None:
         return cached
     with db_session() as session:
@@ -4463,14 +5215,140 @@ def submit_employee_assessment(attempt_id: int, payload: dict[str, Any], authori
             raise HTTPException(status_code=404, detail="Assessment template not found")
         questions = loads_json(template.questions_json, [])
         score, breakdown = compute_template_score(questions, answers)
+        submitted_at = datetime.now(UTC)
         attempt.answers_json = dumps_json(answers)
         attempt.score = score
         attempt.status = "submitted"
-        attempt.submitted_at = datetime.now(UTC).isoformat()
+        attempt.submitted_at = submitted_at.isoformat()
         attempt.result_json = dumps_json({"breakdown": breakdown})
         template_title = str(template.title or "Assessment").strip() or "Assessment"
         employee_name = user.full_name or "Employee"
         score_label = format_score_value(score)
+        started_at = parse_record_datetime(attempt.started_at) or submitted_at
+        duration_minutes = max(1, int((submitted_at - started_at).total_seconds() // 60))
+        duration_label = f"{duration_minutes} min"
+
+        category_label = str(template.category or "general").strip() or "general"
+        rubric = session.get(RubricTemplateRecord, template.rubric_id) if template.rubric_id else None
+        rubric_competencies = loads_json(rubric.competencies_json, []) if rubric else []
+
+        selected_skills: list[str] = []
+        if category_label:
+            selected_skills.append(category_label.title())
+        for competency in rubric_competencies:
+            if not isinstance(competency, dict):
+                continue
+            name = str(competency.get("name") or "").strip()
+            if name:
+                selected_skills.append(name)
+        for question in questions:
+            for keyword in question.get("keywords", []) or []:
+                clean = str(keyword).strip()
+                if clean:
+                    selected_skills.append(clean.title())
+        deduped_skills = list(dict.fromkeys(selected_skills))[:10]
+
+        if score >= 4.2:
+            hiring_signal = "Strong Hire"
+            confidence = "High"
+            strengths = ["Consistently strong answers across core questions.", "Shows role-ready decision quality."]
+            gaps = ["No critical gaps identified in this template run."]
+            recommendations = ["Stretch with advanced scenario-based assessments."]
+        elif score >= 3.2:
+            hiring_signal = "Potential Match"
+            confidence = "Medium"
+            strengths = ["Solid baseline understanding of the assessed domain."]
+            gaps = ["Some answers need stronger depth or precision."]
+            recommendations = ["Run one focused follow-up assessment on weak topics."]
+        else:
+            hiring_signal = "Needs Support"
+            confidence = "Medium"
+            strengths = ["Attempt completed and baseline capability captured."]
+            gaps = ["Multiple fundamentals need reinforcement before production ownership."]
+            recommendations = ["Assign a guided learning plan and reassess in one week."]
+
+        per_domain = [
+            {
+                "domain": category_label.title(),
+                "score": round(score, 2),
+                "signal": "Strong" if score >= 4.2 else "Moderate" if score >= 3.2 else "At Risk",
+            }
+        ]
+
+        journey = get_employee_journey_for_user(session, user.id)
+        profile = journey.get("profile", {}) if isinstance(journey.get("profile"), dict) else {}
+        resume = journey.get("resume", {}) if isinstance(journey.get("resume"), dict) else {}
+        profile_payload = {
+            "fullName": str(profile.get("fullName") or employee_name).strip(),
+            "email": str(profile.get("email") or user.email or "").strip(),
+            "employeeId": user.id,
+            "role": str(profile.get("role") or category_label.title()).strip(),
+            "department": str(profile.get("department") or user.department or "").strip(),
+            "location": str(profile.get("location") or "").strip(),
+            "yearsExperience": str(profile.get("yearsExperience") or "").strip(),
+            "portfolioUrl": str(profile.get("portfolioUrl") or "").strip(),
+            "githubUrl": str(profile.get("githubUrl") or "").strip(),
+            "linkedinUrl": str(profile.get("linkedinUrl") or "").strip(),
+            "photoData": str(profile.get("photoData") or "").strip(),
+            "summary": str(profile.get("summary") or "").strip(),
+        }
+
+        upsert_assessment(
+            session,
+            {
+                "id": f"template-{attempt.id}",
+                "source": "employee-template-assessment",
+                "title": template_title,
+                "employee": employee_name,
+                "employeeId": user.id,
+                "status": "completed",
+                "score": round(score, 2),
+                "date": submitted_at.isoformat(),
+                "duration": duration_label,
+                "interviewer": "Assessment Engine",
+                "focusArea": category_label.title(),
+                "summary": f"{employee_name} scored {score_label}/5 in {template_title}.",
+                "highlights": [
+                    f"Correct responses: {breakdown.get('correct', 0)}/{breakdown.get('total', 0)}",
+                    f"Text evidence hits: {breakdown.get('textHits', 0)}",
+                    f"Assessment category: {category_label.title()}",
+                ],
+                "perDomain": per_domain,
+                "answers": answers,
+                "profile": profile_payload,
+                "resume": resume,
+                "selectedSkills": deduped_skills,
+                "strengths": strengths,
+                "gaps": gaps,
+                "recommendations": recommendations,
+                "hiringSignal": hiring_signal,
+                "confidence": confidence,
+                "evaluationMethod": "assessment-template",
+            },
+        )
+
+        employee_row = session.scalar(select(EmployeeRecord).where(EmployeeRecord.email == user.email))
+        if employee_row:
+            existing_skills = loads_json(employee_row.skills_json, [])
+            merged_skills = list(dict.fromkeys([*existing_skills, *deduped_skills]))[:20]
+            employee_row.skills_json = dumps_json(merged_skills)
+            employee_row.skill_level = round(score, 2)
+            employee_row.status = "active"
+            employee_row.last_assessment = submitted_at.date().isoformat()
+            if not str(employee_row.role or "").strip():
+                employee_row.role = profile_payload["role"] or "Employee"
+        else:
+            session.add(
+                EmployeeRecord(
+                    name=employee_name,
+                    email=user.email,
+                    role=profile_payload["role"] or "Employee",
+                    skills_json=dumps_json(deduped_skills),
+                    skill_level=round(score, 2),
+                    status="active",
+                    last_assessment=submitted_at.date().isoformat(),
+                )
+            )
 
         employee_email = get_user_email_for_notifications(session, user)
         if employee_email and wants_email_notifications(session, user, "assessment"):
@@ -4481,7 +5359,6 @@ def submit_employee_assessment(attempt_id: int, payload: dict[str, Any], authori
                         f"Hi {employee_name},",
                         "",
                         f"Your assessment \"{template_title}\" was submitted successfully.",
-                        f"Score: {score_label}",
                         "",
                         "You can review the results in your dashboard.",
                     ]
@@ -4496,7 +5373,6 @@ def submit_employee_assessment(attempt_id: int, payload: dict[str, Any], authori
                 "\n".join(
                     [
                         f"{employee_name} submitted the assessment \"{template_title}\".",
-                        f"Score: {score_label}",
                         "",
                         "Open the manager dashboard to review details.",
                     ]
@@ -4516,9 +5392,21 @@ def submit_employee_assessment(attempt_id: int, payload: dict[str, Any], authori
                 session,
                 manager,
                 f"Assessment submitted by {employee_name}",
-                f"{employee_name} submitted \"{template_title}\" (score {score_label}).",
+                f"{employee_name} submitted \"{template_title}\".",
                 "assessment",
             )
+        cache_invalidate(
+            "assessments:list",
+            "reports:summary",
+            "leaderboard:summary",
+            "dashboard:summary",
+            "employees:list",
+            "roles:list",
+            "manager:workbench:*",
+            "teams:list",
+            f"notifications:list:{user.id}",
+            *(f"notifications:list:{manager.id}" for manager in managers),
+        )
         return {
             "attempt": serialize_assessment_attempt(attempt),
             "template": serialize_assessment_template(template),
@@ -4591,7 +5479,7 @@ def save_employee_profile(payload: dict[str, Any], authorization: str | None = H
             target="employee_profile",
             meta={"employeeId": employee_id},
         )
-        cache_invalidate("resumes:index")
+        cache_invalidate("resumes:index", "manager:workbench:*")
 
         return journey
 
@@ -4678,7 +5566,7 @@ def save_employee_resume(payload: dict[str, Any], authorization: str | None = He
                 f"{employee_name} uploaded a new resume: {file_name}.",
                 "general",
             )
-        cache_invalidate("resumes:index")
+        cache_invalidate("resumes:index", "manager:workbench:*")
         return journey
 
 
@@ -4724,7 +5612,7 @@ def update_employee_resume(employee_id: str, payload: dict[str, Any]) -> dict[st
         journey["jobMatchAnalysis"] = {}
         journey["jobMatchAnalyzedAt"] = ""
         set_employee_journey_for_user(session, employee_id, journey)
-        cache_invalidate("resumes:index")
+        cache_invalidate("resumes:index", "manager:workbench:*")
         return {"success": True, "employeeId": employee_id, "resume": updated_resume}
 
 
@@ -4804,7 +5692,7 @@ def delete_employee_resume(employee_id: str) -> dict[str, Any]:
         journey["jobMatchAnalysis"] = {}
         journey["jobMatchAnalyzedAt"] = ""
         set_employee_journey_for_user(session, employee_id, journey)
-        cache_invalidate("resumes:index")
+        cache_invalidate("resumes:index", "manager:workbench:*")
         return {"success": True, "employeeId": employee_id}
 
 
@@ -4814,18 +5702,40 @@ def list_employee_resume_index(authorization: str | None = Header(default=None))
     if not user or user.role != "manager":
         raise HTTPException(status_code=401, detail="Unauthorized")
 
-    cached = cache_get("resumes:index", ttl_seconds=8)
+    cached = cache_get("resumes:index", ttl_seconds=30)
     if cached is not None:
         return cached
 
     with db_session() as session:
         users = session.scalars(select(UserRecord).where(UserRecord.role == "employee")).all()
         latest_assessment_by_employee: dict[str, dict[str, Any]] = {}
-        assessments = session.scalars(select(AssessmentRecord).where(AssessmentRecord.source != "seeded")).all()
-        for item in sorted(assessments, key=lambda row: row.date or "", reverse=True):
-            if not item.employee_id or item.employee_id in latest_assessment_by_employee:
+        latest_assessment_sort_keys: dict[str, tuple[float, str]] = {}
+        assessment_rows = session.execute(
+            select(
+                AssessmentRecord.employee_id,
+                AssessmentRecord.date,
+                AssessmentRecord.score,
+                AssessmentRecord.profile_json,
+                AssessmentRecord.resume_json,
+            ).where(AssessmentRecord.source != "seeded")
+        ).all()
+        for row in assessment_rows:
+            employee_id = str(row.employee_id or "").strip()
+            if not employee_id:
                 continue
-            latest_assessment_by_employee[item.employee_id] = serialize_assessment(item)
+            date_value = str(row.date or "").strip()
+            parsed = parse_iso_datetime(date_value)
+            sort_key = (parsed.timestamp() if parsed else 0.0, date_value)
+            previous_key = latest_assessment_sort_keys.get(employee_id)
+            if previous_key is not None and sort_key <= previous_key:
+                continue
+            latest_assessment_sort_keys[employee_id] = sort_key
+            latest_assessment_by_employee[employee_id] = {
+                "date": date_value,
+                "score": float(row.score or 0),
+                "profile": loads_json(row.profile_json, {}),
+                "resume": loads_json(row.resume_json, {}),
+            }
 
         rows: list[dict[str, Any]] = []
         for employee in users:
@@ -4894,7 +5804,7 @@ def save_employee_domains(payload: dict[str, Any], authorization: str | None = H
             target="employee_domains",
             meta={"domains": journey["domains"], "skillsCount": len(journey["skills"])},
         )
-        cache_invalidate("resumes:index")
+        cache_invalidate("resumes:index", "manager:workbench:*")
         return journey
 
 
@@ -4928,6 +5838,7 @@ def get_employee_interview_session(authorization: str | None = Header(default=No
             "sessionId": chat_state["sessionId"],
             "messages": chat_state.get("messages", []),
             "canComplete": chat_state.get("canComplete", False),
+            "proctoring": chat_state.get("proctoring", {"warningCount": 0, "maxWarnings": 3, "blocked": False, "cancelled": False}),
         }
 
 
@@ -4950,6 +5861,11 @@ def chat_employee_interview(payload: dict[str, Any], authorization: str | None =
             raise HTTPException(status_code=404, detail="Interview session not found or expired")
         if chat_state.get("userId") and chat_state.get("userId") != user.id:
             raise HTTPException(status_code=403, detail="This interview session belongs to another employee")
+        proctoring = chat_state.get("proctoring", {}) if isinstance(chat_state.get("proctoring"), dict) else {}
+        if bool(proctoring.get("cancelled")):
+            raise HTTPException(status_code=403, detail="Interview cancelled after repeated proctoring warnings")
+        if bool(proctoring.get("blocked")):
+            raise HTTPException(status_code=403, detail="Multiple people detected. Return to single-person camera view to continue.")
         turn = apply_chat_turn(chat_state, message)
         save_interview_chat_state(session, chat_state)
         return {
@@ -4957,6 +5873,166 @@ def chat_employee_interview(payload: dict[str, Any], authorization: str | None =
             "assistantMessage": turn["assistantMessage"],
             "canComplete": turn["canComplete"],
             "messages": chat_state.get("messages", []),
+        }
+
+
+@app.post("/api/employee/interview/proctoring")
+def report_employee_interview_proctoring(payload: dict[str, Any], authorization: str | None = Header(default=None)) -> dict[str, Any]:
+    user = resolve_user_from_auth(authorization)
+    if not user or user.role != "employee":
+        raise HTTPException(status_code=401, detail="Unauthorized")
+
+    session_id = str(payload.get("sessionId") or "").strip()
+    if not session_id:
+        raise HTTPException(status_code=400, detail="Interview session ID is required")
+
+    event_type = str(payload.get("eventType") or "proctoring_event").strip() or "proctoring_event"
+    action = str(payload.get("action") or "warn").strip().lower()
+    if action not in {"warn", "clear", "cancel"}:
+        action = "warn"
+
+    try:
+        person_count = max(0, min(8, int(payload.get("personCount", 0))))
+    except (TypeError, ValueError):
+        person_count = 0
+
+    with db_session() as session:
+        chat_state = get_interview_chat_state(session, session_id)
+        if not chat_state:
+            raise HTTPException(status_code=404, detail="Interview session not found or expired")
+        if chat_state.get("userId") and chat_state.get("userId") != user.id:
+            raise HTTPException(status_code=403, detail="This interview session belongs to another employee")
+
+        proctoring = chat_state.get("proctoring")
+        if not isinstance(proctoring, dict):
+            proctoring = {}
+
+        max_warnings = int(proctoring.get("maxWarnings", 3) or 3)
+        max_warnings = max(1, min(6, max_warnings))
+        previous_warning_count = int(proctoring.get("warningCount", 0) or 0)
+        warning_count = previous_warning_count
+        if action in {"warn", "cancel"}:
+            provided_warning = payload.get("warningCount")
+            if isinstance(provided_warning, (int, float)):
+                warning_count = max(warning_count, int(provided_warning))
+            else:
+                warning_count += 1
+            warning_count = min(max_warnings, warning_count)
+
+        blocked = bool(proctoring.get("blocked"))
+        cancelled = bool(proctoring.get("cancelled"))
+        if action in {"warn", "cancel"} and person_count > 1:
+            blocked = True
+        if action == "clear" and person_count <= 1 and not cancelled:
+            blocked = False
+        if action == "cancel" or warning_count >= max_warnings:
+            cancelled = True
+            blocked = True
+            chat_state["canComplete"] = False
+
+        now_iso = datetime.now(UTC).isoformat()
+        events = proctoring.get("events", [])
+        if not isinstance(events, list):
+            events = []
+        events.append(
+            {
+                "id": f"proctor-{uuid4().hex[:10]}",
+                "eventType": event_type,
+                "action": action,
+                "personCount": person_count,
+                "warningCount": warning_count,
+                "createdAt": now_iso,
+            }
+        )
+        events = events[-40:]
+
+        last_notice_warning = int(proctoring.get("lastManagerNoticeWarning", 0) or 0)
+        should_notify_manager = action in {"warn", "cancel"} and warning_count > last_notice_warning
+        if should_notify_manager:
+            proctoring["lastManagerNoticeWarning"] = warning_count
+
+        proctoring.update(
+            {
+                "warningCount": warning_count,
+                "maxWarnings": max_warnings,
+                "blocked": blocked,
+                "cancelled": cancelled,
+                "lastPersonCount": person_count,
+                "lastEventAt": now_iso,
+                "events": events,
+            }
+        )
+        chat_state["proctoring"] = proctoring
+        save_interview_chat_state(session, chat_state)
+
+        if cancelled:
+            journey = get_employee_journey_for_user(session, user.id)
+            if str(journey.get("activeInterviewSessionId") or "").strip() == session_id:
+                journey["activeInterviewSessionId"] = None
+                set_employee_journey_for_user(session, user.id, journey)
+
+        status_value = "inactive" if cancelled else ("pending" if warning_count > 0 else "active")
+        sync_employee_record_status(session, user, status_value)
+
+        employee_message = (
+            "Interview cancelled after 3 proctoring warnings (multiple people detected)."
+            if cancelled
+            else (
+                f"Proctoring warning {warning_count}/{max_warnings}: multiple people detected on camera."
+                if action in {"warn", "cancel"}
+                else "Single-person camera view restored. You can continue."
+            )
+        )
+        create_inapp_notification(
+            session,
+            user,
+            "Interview proctoring update",
+            employee_message,
+            "security",
+        )
+
+        manager_ids: list[str] = []
+        if should_notify_manager:
+            managers = session.scalars(select(UserRecord).where(UserRecord.role == "manager")).all()
+            for manager in managers:
+                manager_ids.append(manager.id)
+                create_inapp_notification(
+                    session,
+                    manager,
+                    f"Proctoring warning for {user.full_name}",
+                    (
+                        f"{user.full_name} triggered warning {warning_count}/{max_warnings} during AI interview "
+                        f"(detected people: {person_count})."
+                        + (" Interview has been cancelled." if cancelled else "")
+                    ),
+                    "security",
+                )
+            append_audit_log(
+                session,
+                actor_id=user.id,
+                actor_role="employee",
+                actor_name=user.full_name,
+                action="interview_proctoring_warning",
+                target=session_id,
+                meta={"warningCount": warning_count, "personCount": person_count, "cancelled": cancelled},
+            )
+        cache_invalidate(
+            "employees:list",
+            "dashboard:summary",
+            "manager:workbench:*",
+            "teams:list",
+            f"notifications:list:{user.id}",
+            *(f"notifications:list:{manager_id}" for manager_id in manager_ids),
+        )
+        return {
+            "success": True,
+            "sessionId": session_id,
+            "warningCount": warning_count,
+            "maxWarnings": max_warnings,
+            "blocked": blocked,
+            "cancelled": cancelled,
+            "personCount": person_count,
+            "status": status_value,
         }
 
 
@@ -4973,6 +6049,12 @@ def complete_employee_interview(payload: dict[str, Any], authorization: str | No
             chat_state = get_interview_chat_state(session, session_id)
             if chat_state and chat_state.get("userId") and chat_state.get("userId") != user.id:
                 raise HTTPException(status_code=403, detail="This interview session belongs to another employee")
+            if chat_state:
+                proctoring_state = chat_state.get("proctoring", {}) if isinstance(chat_state.get("proctoring"), dict) else {}
+                if bool(proctoring_state.get("cancelled")):
+                    raise HTTPException(status_code=403, detail="Interview was cancelled due to proctoring violations")
+                if bool(proctoring_state.get("blocked")):
+                    raise HTTPException(status_code=403, detail="Return to single-person camera view before completing")
             if chat_state and chat_state.get("answers"):
                 submitted_answers = chat_state.get("answers", [])
 
@@ -4983,7 +6065,7 @@ def complete_employee_interview(payload: dict[str, Any], authorization: str | No
         )
         result = refine_evaluation_with_gemini(result, journey, submitted_answers)
         upsert_assessment(session, result)
-        cache_invalidate("assessments:list", "reports:summary", "leaderboard:summary", "dashboard:summary", "resumes:index")
+        cache_invalidate("assessments:list", "reports:summary", "leaderboard:summary", "dashboard:summary", "resumes:index", "manager:workbench:*")
         journey["latestResultId"] = result["id"]
         if session_id:
             journey["activeInterviewSessionId"] = None
@@ -5041,6 +6123,7 @@ def complete_employee_interview(payload: dict[str, Any], authorization: str | No
             f"Your interview \"{interview_title}\" is complete with score {score_label}.",
             "assessment",
         )
+        sync_employee_record_status(session, user, "active", last_assessment=datetime.now(UTC).date().isoformat())
         managers = session.scalars(select(UserRecord).where(UserRecord.role == "manager")).all()
         for manager in managers:
             create_inapp_notification(

@@ -1,14 +1,27 @@
 import { motion } from 'framer-motion'
-import { Plus, Search, Edit2, Trash2, CheckCircle, X } from 'lucide-react'
-import { useEffect, useState } from 'react'
+import { Plus, Search, Edit2, Trash2, CheckCircle, Eye, X } from 'lucide-react'
+import { useEffect, useMemo, useState } from 'react'
 import { employeeService } from '../../api/services/employeeService'
+import { managerOpsService } from '../../api/services/managerOpsService'
+import { assessmentService } from '../../api/services/assessmentService'
+
+const normalizeText = (value) => String(value || '').trim().toLowerCase()
+const asList = (value) => (Array.isArray(value) ? value.filter(Boolean) : [])
+const formatDate = (value) => {
+  if (!value) return 'Not available'
+  const parsed = new Date(value)
+  return Number.isNaN(parsed.getTime()) ? String(value) : parsed.toLocaleString()
+}
 
 export default function EmployeeManagement() {
   const [searchTerm, setSearchTerm] = useState('')
   const [showForm, setShowForm] = useState(false)
   const [editingId, setEditingId] = useState(null)
   const [deleteConfirmId, setDeleteConfirmId] = useState(null)
+  const [selectedEmployee, setSelectedEmployee] = useState(null)
   const [employees, setEmployees] = useState([])
+  const [workbenchCandidates, setWorkbenchCandidates] = useState([])
+  const [loadingEmployeeDetails, setLoadingEmployeeDetails] = useState(false)
 
   const [formData, setFormData] = useState({
     name: '',
@@ -22,9 +35,14 @@ export default function EmployeeManagement() {
     let mounted = true
 
     const loadEmployees = async () => {
-      const items = await employeeService.list()
-      if (!mounted) return
-      setEmployees(items)
+      try {
+        const items = await employeeService.list()
+        if (!mounted) return
+        setEmployees(items)
+      } catch {
+        if (!mounted) return
+        setEmployees([])
+      }
     }
 
     loadEmployees()
@@ -41,6 +59,18 @@ export default function EmployeeManagement() {
       emp.role.toLowerCase().includes(searchTerm.toLowerCase()) ||
       emp.status.toLowerCase().includes(searchTerm.toLowerCase())
   )
+
+  const selectedEmployeeDetail = useMemo(() => {
+    if (!selectedEmployee) return null
+    const email = normalizeText(selectedEmployee.email)
+    const name = normalizeText(selectedEmployee.name)
+    const role = normalizeText(selectedEmployee.role)
+    const candidate = workbenchCandidates.find((item) => normalizeText(item?.contact?.email) === email)
+      || workbenchCandidates.find((item) => normalizeText(item?.candidateName) === name)
+      || workbenchCandidates.find((item) => normalizeText(item?.candidateName) === name && normalizeText(item?.role) === role)
+      || null
+    return { employee: selectedEmployee, candidate }
+  }, [selectedEmployee, workbenchCandidates])
 
   const handleFormChange = (e) => {
     const { name, value } = e.target
@@ -99,9 +129,22 @@ export default function EmployeeManagement() {
   }
 
   const handleDeleteEmployee = async (id) => {
-    const nextEmployees = await employeeService.remove(id)
-    setEmployees(nextEmployees)
-    setDeleteConfirmId(null)
+    await employeeService.remove(id)
+    window.location.reload()
+  }
+
+  const handleViewEmployee = async (emp) => {
+    setSelectedEmployee(emp)
+    if (workbenchCandidates.length > 0) return
+    setLoadingEmployeeDetails(true)
+    try {
+      const workbench = await managerOpsService.getWorkbench()
+      setWorkbenchCandidates(asList(workbench?.candidates))
+    } catch {
+      setWorkbenchCandidates([])
+    } finally {
+      setLoadingEmployeeDetails(false)
+    }
   }
 
   return (
@@ -206,6 +249,12 @@ export default function EmployeeManagement() {
                 </td>
                 <td className="py-4 px-4 text-right">
                   <div className="flex items-center justify-end space-x-2">
+                    <button
+                      onClick={() => handleViewEmployee(emp)}
+                      className="p-2 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
+                    >
+                      <Eye className="w-4 h-4" />
+                    </button>
                     <button
                       onClick={() => handleEditEmployee(emp)}
                       className="p-2 rounded-lg hover:bg-gray-700 text-gray-400 hover:text-white transition-colors"
@@ -373,6 +422,193 @@ export default function EmployeeManagement() {
               >
                 Cancel
               </button>
+            </div>
+          </motion.div>
+        </div>
+      )}
+
+      {selectedEmployeeDetail && (
+        <div className="fixed inset-0 bg-black/60 z-50 flex items-center justify-center p-4" onClick={() => setSelectedEmployee(null)}>
+          <motion.div
+            initial={{ opacity: 0, scale: 0.96 }}
+            animate={{ opacity: 1, scale: 1 }}
+            onClick={(e) => e.stopPropagation()}
+            className="w-full max-w-6xl max-h-[90vh] bg-gray-900 border border-gray-700 rounded-2xl shadow-2xl overflow-hidden"
+          >
+            <div className="flex items-center justify-between px-6 py-4 border-b border-gray-700">
+              <div>
+                <p className="text-xs uppercase tracking-[0.2em] text-gray-500">Employee 360 View</p>
+                <h2 className="text-2xl font-bold text-white mt-1">{selectedEmployeeDetail.employee.name}</h2>
+              </div>
+              <button onClick={() => setSelectedEmployee(null)} className="p-2 rounded-lg hover:bg-gray-800 text-gray-400 hover:text-white">
+                <X className="w-5 h-5" />
+              </button>
+            </div>
+
+            <div className="p-6 space-y-5 overflow-y-auto max-h-[calc(90vh-84px)]">
+              <div className="grid grid-cols-1 md:grid-cols-4 gap-3">
+                <div className="rounded-xl border border-gray-700 bg-gray-800/60 p-4">
+                  <p className="text-xs text-gray-400 uppercase">Email</p>
+                  <p className="text-sm text-white mt-1 break-all">{selectedEmployeeDetail.employee.email}</p>
+                </div>
+                <div className="rounded-xl border border-gray-700 bg-gray-800/60 p-4">
+                  <p className="text-xs text-gray-400 uppercase">Role</p>
+                  <p className="text-sm text-white mt-1">{selectedEmployeeDetail.employee.role || 'Not set'}</p>
+                </div>
+                <div className="rounded-xl border border-gray-700 bg-gray-800/60 p-4">
+                  <p className="text-xs text-gray-400 uppercase">Skill Level</p>
+                  <p className="text-sm text-white mt-1">{selectedEmployeeDetail.employee.skillLevel}/5</p>
+                </div>
+                <div className="rounded-xl border border-gray-700 bg-gray-800/60 p-4">
+                  <p className="text-xs text-gray-400 uppercase">Status</p>
+                  <p className="text-sm text-white mt-1 capitalize">{selectedEmployeeDetail.employee.status}</p>
+                </div>
+              </div>
+
+              {loadingEmployeeDetails ? (
+                <div className="rounded-xl border border-white/10 bg-black/20 px-4 py-3 text-sm text-gray-300">
+                  Loading employee full details...
+                </div>
+              ) : !selectedEmployeeDetail.candidate ? (
+                <div className="rounded-xl border border-amber-500/40 bg-amber-500/10 p-4 text-sm text-amber-100">
+                  No full employee journey is linked yet for this employee. We can show base employee table data, but resume/job-match/interview records need a linked employee account session.
+                </div>
+              ) : (
+                <>
+                  <div className="rounded-xl border border-gray-700 bg-gray-800/40 p-5">
+                    <h3 className="text-lg font-semibold text-white">Profile & Contact</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-3 gap-3 mt-3 text-sm">
+                      <p className="text-gray-300"><span className="text-gray-500">Department:</span> {selectedEmployeeDetail.candidate.department || 'Not set'}</p>
+                      <p className="text-gray-300"><span className="text-gray-500">Phone:</span> {selectedEmployeeDetail.candidate.contact?.phone || 'Not set'}</p>
+                      <p className="text-gray-300"><span className="text-gray-500">Location:</span> {selectedEmployeeDetail.candidate.contact?.location || 'Not set'}</p>
+                      <p className="text-gray-300"><span className="text-gray-500">Experience:</span> {selectedEmployeeDetail.candidate.profile?.yearsExperience || 'Not set'} years</p>
+                      <p className="text-gray-300"><span className="text-gray-500">Portfolio:</span> {selectedEmployeeDetail.candidate.profile?.portfolioUrl || 'Not provided'}</p>
+                      <p className="text-gray-300"><span className="text-gray-500">GitHub:</span> {selectedEmployeeDetail.candidate.profile?.githubUrl || 'Not provided'}</p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-gray-700 bg-gray-800/40 p-5">
+                    <h3 className="text-lg font-semibold text-white">Skills & Gaps</h3>
+                    <div className="mt-3 grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <p className="text-xs uppercase text-gray-400 tracking-[0.16em]">Employee Skills</p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {asList(selectedEmployeeDetail.employee.skills).map((skill) => (
+                            <span key={`base-${skill}`} className="px-2 py-1 text-xs bg-gray-700 text-gray-200 rounded border border-gray-600">{skill}</span>
+                          ))}
+                        </div>
+                        <p className="text-xs uppercase text-gray-400 tracking-[0.16em] mt-4">Resume Skills</p>
+                        <div className="mt-2 flex flex-wrap gap-2">
+                          {asList(selectedEmployeeDetail.candidate.resume?.skills).map((skill) => (
+                            <span key={`resume-${skill}`} className="px-2 py-1 text-xs bg-blue-500/15 text-blue-200 rounded border border-blue-400/30">{skill}</span>
+                          ))}
+                        </div>
+                      </div>
+                      <div>
+                        <p className="text-xs uppercase text-gray-400 tracking-[0.16em]">Role Match Gaps</p>
+                        <ul className="mt-2 space-y-2">
+                          {asList(selectedEmployeeDetail.candidate.jobMatch?.missingSkills).slice(0, 8).map((gap) => (
+                            <li key={gap} className="text-sm text-amber-200 rounded-lg border border-amber-500/20 bg-amber-500/10 px-3 py-2">{gap}</li>
+                          ))}
+                          {asList(selectedEmployeeDetail.candidate.interview?.gaps).slice(0, 4).map((gap) => (
+                            <li key={gap} className="text-sm text-red-200 rounded-lg border border-red-500/20 bg-red-500/10 px-3 py-2">{gap}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-gray-700 bg-gray-800/40 p-5">
+                    <div className="flex flex-wrap items-center justify-between gap-3">
+                      <h3 className="text-lg font-semibold text-white">Resume Intelligence</h3>
+                      {selectedEmployeeDetail.candidate.employeeId && selectedEmployeeDetail.candidate.resume?.fileName && (
+                        <a
+                          href={assessmentService.getResumeViewUrl(selectedEmployeeDetail.candidate.employeeId)}
+                          target="_blank"
+                          rel="noreferrer"
+                          className="px-3 py-1.5 rounded-lg border border-gray-600 text-xs text-gray-200 hover:bg-gray-800"
+                        >
+                          View Resume File
+                        </a>
+                      )}
+                    </div>
+                    <div className="mt-3 text-sm text-gray-300 space-y-2">
+                      <p><span className="text-gray-500">File:</span> {selectedEmployeeDetail.candidate.resume?.fileName || 'Not uploaded'}</p>
+                      <p><span className="text-gray-500">Uploaded:</span> {formatDate(selectedEmployeeDetail.candidate.resume?.uploadedAt)}</p>
+                      <p><span className="text-gray-500">Analysis status:</span> {selectedEmployeeDetail.candidate.resume?.analysisStatus || 'Not started'}</p>
+                      <p><span className="text-gray-500">Quality:</span> {selectedEmployeeDetail.candidate.resume?.qualityGrade || 'N/A'}</p>
+                      <p className="text-gray-200">{selectedEmployeeDetail.candidate.resume?.summary || 'No resume summary available yet.'}</p>
+                    </div>
+                  </div>
+
+                  <div className="rounded-xl border border-gray-700 bg-gray-800/40 p-5">
+                    <h3 className="text-lg font-semibold text-white">Assessment & Interview Snapshot</h3>
+                    <div className="grid grid-cols-1 md:grid-cols-4 gap-3 mt-3">
+                      <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+                        <p className="text-xs text-gray-500 uppercase">Match Score</p>
+                        <p className="text-xl font-semibold text-white mt-1">{Number(selectedEmployeeDetail.candidate.jobMatch?.score || 0)}%</p>
+                      </div>
+                      <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+                        <p className="text-xs text-gray-500 uppercase">Interview Score</p>
+                        <p className="text-xl font-semibold text-white mt-1">{Number(selectedEmployeeDetail.candidate.interview?.score || 0).toFixed(1)}/5</p>
+                      </div>
+                      <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+                        <p className="text-xs text-gray-500 uppercase">Hiring Signal</p>
+                        <p className="text-sm font-semibold text-white mt-1">{selectedEmployeeDetail.candidate.interview?.hiringSignal || 'Pending'}</p>
+                      </div>
+                      <div className="rounded-lg border border-gray-700 bg-gray-900/60 p-3">
+                        <p className="text-xs text-gray-500 uppercase">Confidence</p>
+                        <p className="text-sm font-semibold text-white mt-1">{selectedEmployeeDetail.candidate.interview?.confidence || 'N/A'}</p>
+                      </div>
+                    </div>
+                    <div className="mt-4 grid grid-cols-1 md:grid-cols-2 gap-4">
+                      <div>
+                        <p className="text-xs uppercase text-gray-400 tracking-[0.16em]">Strengths</p>
+                        <ul className="mt-2 space-y-2">
+                          {asList(selectedEmployeeDetail.candidate.interview?.strengths).slice(0, 5).map((item) => (
+                            <li key={item} className="text-sm text-emerald-200 rounded-lg border border-emerald-500/20 bg-emerald-500/10 px-3 py-2">{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+                      <div>
+                        <p className="text-xs uppercase text-gray-400 tracking-[0.16em]">Recommendations</p>
+                        <ul className="mt-2 space-y-2">
+                          {asList(selectedEmployeeDetail.candidate.interview?.recommendations).slice(0, 5).map((item) => (
+                            <li key={item} className="text-sm text-blue-200 rounded-lg border border-blue-500/20 bg-blue-500/10 px-3 py-2">{item}</li>
+                          ))}
+                        </ul>
+                      </div>
+                    </div>
+                  </div>
+
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <div className="rounded-xl border border-gray-700 bg-gray-800/40 p-5">
+                      <h3 className="text-lg font-semibold text-white">Scheduled Interviews</h3>
+                      <div className="mt-3 space-y-2">
+                        {asList(selectedEmployeeDetail.candidate.schedules).slice(0, 6).map((item) => (
+                          <div key={item.id} className="rounded-lg border border-gray-700 bg-gray-900/60 px-3 py-2">
+                            <p className="text-sm text-white">{item.title || 'Interview'}</p>
+                            <p className="text-xs text-gray-400 mt-1">{formatDate(item.startAt)} - {item.meetingMode || 'Virtual'}</p>
+                          </div>
+                        ))}
+                        {asList(selectedEmployeeDetail.candidate.schedules).length === 0 && <p className="text-sm text-gray-500">No schedules found.</p>}
+                      </div>
+                    </div>
+                    <div className="rounded-xl border border-gray-700 bg-gray-800/40 p-5">
+                      <h3 className="text-lg font-semibold text-white">Communication History</h3>
+                      <div className="mt-3 space-y-2">
+                        {asList(selectedEmployeeDetail.candidate.communications).slice(0, 6).map((item) => (
+                          <div key={item.id} className="rounded-lg border border-gray-700 bg-gray-900/60 px-3 py-2">
+                            <p className="text-sm text-white capitalize">{item.channel || 'message'} - {item.deliveryStatus || 'recorded'}</p>
+                            <p className="text-xs text-gray-400 mt-1">{formatDate(item.createdAt)}</p>
+                          </div>
+                        ))}
+                        {asList(selectedEmployeeDetail.candidate.communications).length === 0 && <p className="text-sm text-gray-500">No communications logged.</p>}
+                      </div>
+                    </div>
+                  </div>
+                </>
+              )}
             </div>
           </motion.div>
         </div>

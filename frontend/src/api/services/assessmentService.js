@@ -36,6 +36,11 @@ export const assessmentService = {
     return response.data
   },
 
+  async updateAssessment(assessmentId, payload) {
+    const response = await apiClient.put(API_ENDPOINTS.assessments.detail(assessmentId), payload)
+    return response.data
+  },
+
   async getById(assessmentId) {
     const response = await apiClient.get(API_ENDPOINTS.assessments.detail(assessmentId))
     return response.data

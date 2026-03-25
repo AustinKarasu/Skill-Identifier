@@ -131,11 +131,7 @@ export default function ResumeReview() {
     setViewerState({ status: 'loading', message: 'Deleting resume...' })
     try {
       await assessmentService.deleteResume(selectedRow.employeeId)
-      await loadResumeRows()
-      setSelectedEmployeeId('')
-      setViewerState({ status: 'ready', message: 'Resume deleted successfully.' })
-      setPreviewEnabled(false)
-      setViewerRefreshKey((prev) => prev + 1)
+      window.location.reload()
     } catch (error) {
       setViewerState({ status: 'error', message: error.message })
     }

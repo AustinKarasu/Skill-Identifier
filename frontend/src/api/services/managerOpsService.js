@@ -12,6 +12,11 @@ export const managerOpsService = {
     return response.data
   },
 
+  async deleteSchedule(scheduleId) {
+    const response = await apiClient.delete(API_ENDPOINTS.manager.scheduleDelete(scheduleId))
+    return response.data
+  },
+
   async sendCommunication(payload) {
     const response = await apiClient.post(API_ENDPOINTS.manager.sendCommunication, payload)
     return response.data
@@ -24,6 +29,11 @@ export const managerOpsService = {
 
   async updateCandidateProfile(employeeId, payload) {
     const response = await apiClient.put(API_ENDPOINTS.manager.updateCandidateProfile(employeeId), payload)
+    return response.data
+  },
+
+  async deleteCandidate(employeeId) {
+    const response = await apiClient.delete(API_ENDPOINTS.manager.deleteCandidate(employeeId))
     return response.data
   },
 

@@ -1,5 +1,5 @@
 import { motion } from 'framer-motion'
-import { Clock, CheckCircle, AlertCircle, CalendarDays, User, X, FileText, Search, BrainCircuit, Download } from 'lucide-react'
+import { Clock, CheckCircle, AlertCircle, CalendarDays, User, X, FileText, Search, BrainCircuit, Download, Pencil, Save, Trash2 } from 'lucide-react'
 import { useEffect, useMemo, useState } from 'react'
 import { assessmentService } from '../../api/services/assessmentService'
 
@@ -10,6 +10,19 @@ export default function Assessments() {
   const [loading, setLoading] = useState(true)
   const [loadError, setLoadError] = useState('')
   const [resumeState, setResumeState] = useState({ status: 'idle', message: '' })
+  const [editMode, setEditMode] = useState(false)
+  const [savingEdit, setSavingEdit] = useState(false)
+  const [deletingAssessmentId, setDeletingAssessmentId] = useState('')
+  const [editForm, setEditForm] = useState({
+    title: '',
+    status: 'completed',
+    score: '',
+    summary: '',
+    focusArea: '',
+    duration: '',
+    hiringSignal: '',
+    confidence: '',
+  })
 
   const loadAssessments = async () => {
     setLoading(true)
@@ -140,6 +153,68 @@ export default function Assessments() {
     }
   }
 
+  const buildEditForm = (record) => ({
+    title: record?.title || '',
+    status: record?.status || 'completed',
+    score: Number(record?.score || 0) > 0 ? String(record.score) : '',
+    summary: record?.summary || '',
+    focusArea: record?.focusArea || '',
+    duration: record?.duration || '',
+    hiringSignal: record?.hiringSignal || '',
+    confidence: record?.confidence || '',
+  })
+
+  const openAssessment = (record, startEdit = false) => {
+    setResumeState({ status: 'idle', message: '' })
+    setSelectedAssessment(record)
+    setEditForm(buildEditForm(record))
+    setEditMode(startEdit)
+  }
+
+  const handleDeleteAssessment = async (record) => {
+    if (!record?.id || deletingAssessmentId) return
+    if (!window.confirm(`Delete assessment "${record.title}" for ${record.employee}?`)) return
+    setDeletingAssessmentId(record.id)
+    setLoadError('')
+    try {
+      await assessmentService.deleteAssessment(record.id)
+      window.location.reload()
+    } catch (error) {
+      setLoadError(error.message)
+    } finally {
+      setDeletingAssessmentId('')
+    }
+  }
+
+  const handleSaveEdit = async () => {
+    if (!selectedAssessment || savingEdit) return
+    setSavingEdit(true)
+    setLoadError('')
+    try {
+      const payload = {
+        title: editForm.title,
+        status: editForm.status,
+        summary: editForm.summary,
+        focusArea: editForm.focusArea,
+        duration: editForm.duration,
+        hiringSignal: editForm.hiringSignal,
+        confidence: editForm.confidence,
+      }
+      if (String(editForm.score).trim()) {
+        payload.score = Number(editForm.score)
+      }
+      const updated = await assessmentService.updateAssessment(selectedAssessment.id, payload)
+      setAssessmentRecords((current) => current.map((item) => (item.id === updated.id ? updated : item)))
+      setSelectedAssessment(updated)
+      setEditForm(buildEditForm(updated))
+      setEditMode(false)
+    } catch (error) {
+      setLoadError(error.message)
+    } finally {
+      setSavingEdit(false)
+    }
+  }
+
   return (
     <div className="space-y-6">
       <motion.div initial={{ opacity: 0, y: -20 }} animate={{ opacity: 1, y: 0 }}>
@@ -261,15 +336,27 @@ export default function Assessments() {
                   {formatAssessmentDate(record.date)}
                 </td>
                 <td className="py-4 px-4 text-center">
-                  <button
-                    onClick={() => {
-                      setResumeState({ status: 'idle', message: '' })
-                      setSelectedAssessment(record)
-                    }}
-                    className="text-blue-400 hover:text-blue-300 font-medium text-sm"
-                  >
-                    View
-                  </button>
+                  <div className="flex items-center justify-center gap-3">
+                    <button
+                      onClick={() => openAssessment(record)}
+                      className="text-blue-400 hover:text-blue-300 font-medium text-sm"
+                    >
+                      View
+                    </button>
+                    <button
+                      onClick={() => openAssessment(record, true)}
+                      className="text-amber-300 hover:text-amber-200 font-medium text-sm"
+                    >
+                      Edit
+                    </button>
+                    <button
+                      onClick={() => handleDeleteAssessment(record)}
+                      disabled={deletingAssessmentId === record.id}
+                      className="text-red-300 hover:text-red-200 font-medium text-sm disabled:opacity-60"
+                    >
+                      {deletingAssessmentId === record.id ? 'Deleting...' : 'Delete'}
+                    </button>
+                  </div>
                 </td>
               </motion.tr>
             ))}
@@ -292,6 +379,7 @@ export default function Assessments() {
           onClick={() => {
             setResumeState({ status: 'idle', message: '' })
             setSelectedAssessment(null)
+            setEditMode(false)
           }}
         >
           <motion.div
@@ -313,16 +401,36 @@ export default function Assessments() {
                   </span>
                 </div>
               </div>
-              <button
-                onClick={() => {
-                  setResumeState({ status: 'idle', message: '' })
-                  setSelectedAssessment(null)
-                }}
-                className="p-2 rounded-lg hover:bg-gray-800 text-gray-400 hover:text-white transition-colors"
-                aria-label="Close assessment details"
-              >
-                <X className="w-5 h-5" />
-              </button>
+              <div className="flex items-center gap-2">
+                <button
+                  type="button"
+                  onClick={() => setEditMode((current) => !current)}
+                  className="inline-flex items-center gap-2 rounded-lg border border-amber-500/40 px-3 py-2 text-sm text-amber-200 hover:bg-amber-500/10"
+                >
+                  <Pencil className="w-4 h-4" />
+                  <span>{editMode ? 'Cancel edit' : 'Edit'}</span>
+                </button>
+                <button
+                  type="button"
+                  onClick={() => handleDeleteAssessment(selectedAssessment)}
+                  disabled={deletingAssessmentId === selectedAssessment.id}
+                  className="inline-flex items-center gap-2 rounded-lg border border-red-500/40 px-3 py-2 text-sm text-red-300 hover:bg-red-500/10 disabled:opacity-60"
+                >
+                  <Trash2 className="w-4 h-4" />
+                  <span>{deletingAssessmentId === selectedAssessment.id ? 'Deleting...' : 'Delete'}</span>
+                </button>
+                <button
+                  onClick={() => {
+                    setResumeState({ status: 'idle', message: '' })
+                    setSelectedAssessment(null)
+                    setEditMode(false)
+                  }}
+                  className="p-2 rounded-lg hover:bg-gray-800 text-gray-400 hover:text-white transition-colors"
+                  aria-label="Close assessment details"
+                >
+                  <X className="w-5 h-5" />
+                </button>
+              </div>
             </div>
 
             <div className="p-6 space-y-6 overflow-y-auto max-h-[calc(90vh-96px)]">
@@ -335,6 +443,80 @@ export default function Assessments() {
                       : 'border-red-500/30 bg-red-500/10 text-red-300'
                 }`}>
                   {resumeState.message}
+                </div>
+              )}
+
+              {editMode && (
+                <div className="rounded-xl border border-amber-500/30 bg-amber-500/5 p-5 space-y-4">
+                  <h3 className="text-lg font-semibold text-white">Edit Assessment Record</h3>
+                  <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                    <input
+                      value={editForm.title}
+                      onChange={(e) => setEditForm((current) => ({ ...current, title: e.target.value }))}
+                      placeholder="Assessment title"
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    />
+                    <select
+                      value={editForm.status}
+                      onChange={(e) => setEditForm((current) => ({ ...current, status: e.target.value }))}
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    >
+                      <option value="submitted">Submitted</option>
+                      <option value="pending">Pending</option>
+                      <option value="in-progress">In Progress</option>
+                      <option value="completed">Completed</option>
+                    </select>
+                    <input
+                      value={editForm.score}
+                      onChange={(e) => setEditForm((current) => ({ ...current, score: e.target.value }))}
+                      placeholder="Score (0-5)"
+                      type="number"
+                      min="0"
+                      max="5"
+                      step="0.1"
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    />
+                    <input
+                      value={editForm.focusArea}
+                      onChange={(e) => setEditForm((current) => ({ ...current, focusArea: e.target.value }))}
+                      placeholder="Focus area"
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    />
+                    <input
+                      value={editForm.duration}
+                      onChange={(e) => setEditForm((current) => ({ ...current, duration: e.target.value }))}
+                      placeholder="Duration (e.g. 25 min)"
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    />
+                    <input
+                      value={editForm.hiringSignal}
+                      onChange={(e) => setEditForm((current) => ({ ...current, hiringSignal: e.target.value }))}
+                      placeholder="Hiring signal"
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    />
+                    <input
+                      value={editForm.confidence}
+                      onChange={(e) => setEditForm((current) => ({ ...current, confidence: e.target.value }))}
+                      placeholder="Confidence"
+                      className="rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                    />
+                  </div>
+                  <textarea
+                    value={editForm.summary}
+                    onChange={(e) => setEditForm((current) => ({ ...current, summary: e.target.value }))}
+                    rows={4}
+                    placeholder="Manager summary"
+                    className="w-full rounded-lg border border-gray-700 bg-gray-800 px-3 py-2 text-white"
+                  />
+                  <button
+                    type="button"
+                    onClick={handleSaveEdit}
+                    disabled={savingEdit}
+                    className="inline-flex items-center gap-2 rounded-lg bg-white text-black px-4 py-2 font-semibold hover:bg-gray-200 disabled:opacity-60"
+                  >
+                    <Save className="w-4 h-4" />
+                    <span>{savingEdit ? 'Saving...' : 'Save changes'}</span>
+                  </button>
                 </div>
               )}
 

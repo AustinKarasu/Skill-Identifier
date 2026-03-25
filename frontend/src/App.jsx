@@ -12,6 +12,7 @@ import Settings from './components/dashboard/Settings'
 import ResumeReview from './components/dashboard/ResumeReview'
 import AssessmentEngine from './components/dashboard/AssessmentEngine'
 import ManagerOps from './components/dashboard/ManagerOps'
+import Teams from './components/dashboard/Teams'
 import PublicOnlyRoute from './components/routing/PublicOnlyRoute'
 import RoleProtectedRoute from './components/routing/RoleProtectedRoute'
 import AuthShell from './Login/AuthShell'
@@ -84,6 +85,14 @@ function App() {
             element={
               <AdminLayout>
                 <ManagerOps />
+              </AdminLayout>
+            }
+          />
+          <Route
+            path="/teams"
+            element={
+              <AdminLayout>
+                <Teams />
               </AdminLayout>
             }
           />

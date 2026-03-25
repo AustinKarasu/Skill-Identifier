@@ -110,6 +110,17 @@ export const employeeJourneyService = {
     return response.data
   },
 
+  async reportInterviewProctoring({ sessionId, eventType, personCount, warningCount, action }) {
+    const response = await apiClient.post(API_ENDPOINTS.employee.interviewProctoring, {
+      sessionId,
+      eventType,
+      personCount,
+      warningCount,
+      action,
+    })
+    return response.data
+  },
+
   async saveInterviewResult({ answers, durationMinutes, sessionId }) {
     const response = await apiClient.post(API_ENDPOINTS.employee.interviewComplete, {
       answers,

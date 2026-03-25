@@ -111,12 +111,8 @@ export default function RoleManagement() {
   }
 
   const handleDeleteRole = async (id) => {
-    const nextRoles = await roleService.remove(id)
-    setRoles(nextRoles)
-    setDeleteConfirmId(null)
-    if (selectedRole?.id === id) {
-      setSelectedRole(null)
-    }
+    await roleService.remove(id)
+    window.location.reload()
   }
 
   const getReadinessColor = (readiness) => {
@@ -138,6 +134,11 @@ export default function RoleManagement() {
       day: 'numeric',
       year: 'numeric',
     })
+
+  const getMemberCount = (role) => {
+    if (Array.isArray(role?.members)) return role.members.length
+    return Number(role?.employees || 0)
+  }
 
   return (
     <div className="space-y-6">
@@ -167,7 +168,7 @@ export default function RoleManagement() {
             <div className="flex items-start justify-between mb-6">
               <div>
                 <h3 className="text-xl font-bold text-white mb-2">{role.name}</h3>
-                <p className="text-sm text-gray-400">{role.employees} members in this role</p>
+                <p className="text-sm text-gray-400">{getMemberCount(role)} members in this role</p>
               </div>
               <div className="flex space-x-2">
                 <button
@@ -376,7 +377,7 @@ export default function RoleManagement() {
                     <Users className="w-4 h-4" />
                   <span>Members</span>
                   </div>
-                  <p className="text-white font-semibold mt-2">{selectedRole.employees}</p>
+                  <p className="text-white font-semibold mt-2">{getMemberCount(selectedRole)}</p>
                 </div>
                 <div className="rounded-xl border border-gray-700 bg-gray-800/70 p-4">
                   <div className="flex items-center gap-2 text-gray-400 text-sm">
@@ -418,7 +419,7 @@ export default function RoleManagement() {
                 </div>
                 <div className="rounded-xl border border-gray-700 bg-gray-800/50 p-5">
                   <p className="text-sm text-gray-400">Team Coverage</p>
-                  <p className="text-white font-semibold mt-2">{selectedRole.members?.length || 0} named members linked to this role</p>
+                  <p className="text-white font-semibold mt-2">{getMemberCount(selectedRole)} named members linked to this role</p>
                 </div>
               </div>
 

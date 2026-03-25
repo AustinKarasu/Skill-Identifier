@@ -3,6 +3,7 @@ import { motion } from 'framer-motion'
 import {
   AlertTriangle,
   BarChart3,
+  Camera,
   CheckCircle2,
   Download,
   Loader2,
@@ -10,6 +11,7 @@ import {
   MicOff,
   Send,
   Share2,
+  ShieldAlert,
   Sparkles,
   Volume2,
   VolumeX,
@@ -33,6 +35,9 @@ const clampScore = (score) => {
   return Math.max(0, Math.min(5, parsed)).toFixed(1)
 }
 
+const PROCTORING_MAX_WARNINGS = 3
+const MULTI_PERSON_WARNING_COOLDOWN_MS = 7000
+
 export default function EmployeeInterview() {
   const { user } = useAuth()
   const navigate = useNavigate()
@@ -54,14 +59,51 @@ export default function EmployeeInterview() {
   const [shareState, setShareState] = useState('')
   const [feedbackState, setFeedbackState] = useState({ rating: 5, clarity: 5, fairness: 5, comments: '' })
   const [feedbackSaved, setFeedbackSaved] = useState(false)
+  const [interviewReady, setInterviewReady] = useState(false)
+  const [startingInterview, setStartingInterview] = useState(false)
+  const [cameraReady, setCameraReady] = useState(false)
+  const [cameraError, setCameraError] = useState('')
+  const [faceDetectionAvailable, setFaceDetectionAvailable] = useState(true)
+  const [faceDetectionMode, setFaceDetectionMode] = useState('none')
+  const [cameraPermissionRequested, setCameraPermissionRequested] = useState(false)
+  const [proctoringState, setProctoringState] = useState({
+    warningCount: 0,
+    maxWarnings: PROCTORING_MAX_WARNINGS,
+    personCount: 0,
+    blocked: false,
+    cancelled: false,
+    lastEventMessage: '',
+  })
 
   const transcriptContainerRef = useRef(null)
   const recognitionRef = useRef(null)
   const spokenMessageRef = useRef('')
+  const videoRef = useRef(null)
+  const cameraStreamRef = useRef(null)
+  const detectorRef = useRef(null)
+  const fallbackDetectorRef = useRef(null)
+  const detectionIntervalRef = useRef(null)
+  const detectionBusyRef = useRef(false)
+  const warningCooldownUntilRef = useRef(0)
+  const proctoringStateRef = useRef(proctoringState)
+  const interviewReadyRef = useRef(false)
+  const faceDetectionAvailableRef = useRef(true)
 
   const displayName = useMemo(() => {
     return journey?.profile?.fullName || user?.fullName || 'Employee Candidate'
   }, [journey?.profile?.fullName, user?.fullName])
+
+  useEffect(() => {
+    proctoringStateRef.current = proctoringState
+  }, [proctoringState])
+
+  useEffect(() => {
+    interviewReadyRef.current = interviewReady
+  }, [interviewReady])
+
+  useEffect(() => {
+    faceDetectionAvailableRef.current = faceDetectionAvailable
+  }, [faceDetectionAvailable])
 
   useEffect(() => {
     let mounted = true
@@ -75,13 +117,31 @@ export default function EmployeeInterview() {
         ])
         if (!mounted) return
         const initialMessages = Array.isArray(session.messages) ? session.messages : []
+        const initialProctoring = session?.proctoring || {}
+        setProctoringState((prev) => ({
+          ...prev,
+          warningCount: Number(initialProctoring.warningCount || 0),
+          maxWarnings: Number(initialProctoring.maxWarnings || PROCTORING_MAX_WARNINGS),
+          blocked: Boolean(initialProctoring.blocked),
+          cancelled: Boolean(initialProctoring.cancelled),
+          personCount: Number(initialProctoring.lastPersonCount || 0),
+        }))
         if (initialMessages.length === 0) {
           const retrySession = await employeeJourneyService.startInterviewSession()
           if (!mounted) return
           const retryMessages = Array.isArray(retrySession.messages) ? retrySession.messages : []
+          const retryProctoring = retrySession?.proctoring || {}
           setSessionId(retrySession.sessionId || '')
           setMessages(retryMessages)
           setCanComplete(Boolean(retrySession.canComplete))
+          setProctoringState((prev) => ({
+            ...prev,
+            warningCount: Number(retryProctoring.warningCount || 0),
+            maxWarnings: Number(retryProctoring.maxWarnings || PROCTORING_MAX_WARNINGS),
+            blocked: Boolean(retryProctoring.blocked),
+            cancelled: Boolean(retryProctoring.cancelled),
+            personCount: Number(retryProctoring.lastPersonCount || 0),
+          }))
           setJourney(journeyData)
           if (retryMessages.length === 0) {
             setError('Interview session opened but no prompt was returned. Refresh once and try again.')
@@ -173,11 +233,310 @@ export default function EmployeeInterview() {
     window.speechSynthesis.speak(utterance)
   }, [messages, voiceOutputEnabled])
 
+  const stopDetectionLoop = () => {
+    if (detectionIntervalRef.current) {
+      window.clearInterval(detectionIntervalRef.current)
+      detectionIntervalRef.current = null
+    }
+  }
+
+  const shutdownCamera = () => {
+    stopDetectionLoop()
+    const stream = cameraStreamRef.current
+    if (stream) {
+      stream.getTracks().forEach((track) => track.stop())
+      cameraStreamRef.current = null
+    }
+    if (videoRef.current) {
+      videoRef.current.srcObject = null
+    }
+    setCameraReady(false)
+    setCameraPermissionRequested(false)
+  }
+
+  const ensureFaceDetector = async () => {
+    if (detectorRef.current || fallbackDetectorRef.current) return true
+    if (!('FaceDetector' in window)) {
+      try {
+        const tf = await import('https://esm.sh/@tensorflow/tfjs-core@4.22.0?bundle')
+        await import('https://esm.sh/@tensorflow/tfjs-backend-webgl@4.22.0?bundle')
+        await import('https://esm.sh/@tensorflow/tfjs-backend-cpu@4.22.0?bundle')
+        const blazefaceModule = await import('https://esm.sh/@tensorflow-models/blazeface@0.1.0?bundle')
+        try {
+          await tf.setBackend('webgl')
+        } catch {
+          await tf.setBackend('cpu')
+        }
+        await tf.ready()
+        fallbackDetectorRef.current = await blazefaceModule.load()
+        setFaceDetectionAvailable(true)
+        setFaceDetectionMode('fallback')
+        return true
+      } catch {
+        setFaceDetectionAvailable(false)
+        setFaceDetectionMode('none')
+        setCameraError('Advanced multi-person detection failed to load. Please allow network access and retry.')
+        return false
+      }
+    }
+    try {
+      detectorRef.current = new window.FaceDetector({ maxDetectedFaces: 3, fastMode: true })
+      setFaceDetectionAvailable(true)
+      setFaceDetectionMode('native')
+      return true
+    } catch {
+      try {
+        const tf = await import('https://esm.sh/@tensorflow/tfjs-core@4.22.0?bundle')
+        await import('https://esm.sh/@tensorflow/tfjs-backend-webgl@4.22.0?bundle')
+        await import('https://esm.sh/@tensorflow/tfjs-backend-cpu@4.22.0?bundle')
+        const blazefaceModule = await import('https://esm.sh/@tensorflow-models/blazeface@0.1.0?bundle')
+        try {
+          await tf.setBackend('webgl')
+        } catch {
+          await tf.setBackend('cpu')
+        }
+        await tf.ready()
+        fallbackDetectorRef.current = await blazefaceModule.load()
+        setFaceDetectionAvailable(true)
+        setFaceDetectionMode('fallback')
+        return true
+      } catch {
+        setFaceDetectionAvailable(false)
+        setFaceDetectionMode('none')
+        setCameraError('Unable to initialize advanced face detection. Please retry in a modern browser.')
+        return false
+      }
+    }
+  }
+
+  const ensureCamera = async () => {
+    setCameraPermissionRequested(true)
+    if (cameraStreamRef.current) {
+      setCameraReady(true)
+      return true
+    }
+    if (!navigator.mediaDevices?.getUserMedia) {
+      setCameraError('Camera access is not supported in this browser.')
+      return false
+    }
+    try {
+      const stream = await navigator.mediaDevices.getUserMedia({
+        video: {
+          facingMode: 'user',
+          width: { ideal: 640 },
+          height: { ideal: 640 },
+        },
+        audio: false,
+      })
+      cameraStreamRef.current = stream
+      if (videoRef.current) {
+        videoRef.current.srcObject = stream
+        await videoRef.current.play()
+      }
+      setCameraReady(true)
+      setCameraError('')
+      return true
+    } catch {
+      setCameraError('Camera permission is required to start the AI interview.')
+      return false
+    }
+  }
+
+  const detectPersonCount = async () => {
+    if (!faceDetectionAvailableRef.current) return 0
+    if (!videoRef.current) return 0
+    if (videoRef.current.readyState < 2) return 0
+    try {
+      if (detectorRef.current) {
+        const faces = await detectorRef.current.detect(videoRef.current)
+        return Array.isArray(faces) ? faces.length : 0
+      }
+      if (fallbackDetectorRef.current) {
+        const faces = await fallbackDetectorRef.current.estimateFaces(videoRef.current, false)
+        return Array.isArray(faces) ? faces.length : 0
+      }
+      return 0
+    } catch {
+      return 0
+    }
+  }
+
+  const reportProctoringEvent = async ({ eventType, personCount, warningCount, action }) => {
+    if (!sessionId) return null
+    try {
+      return await employeeJourneyService.reportInterviewProctoring({
+        sessionId,
+        eventType,
+        personCount,
+        warningCount,
+        action,
+      })
+    } catch (eventError) {
+      setError(eventError?.message || 'Unable to sync camera warning with backend.')
+      return null
+    }
+  }
+
+  const cancelInterviewForPolicy = async (personCount) => {
+    if (isListening && recognitionRef.current) recognitionRef.current.stop()
+    setCanComplete(false)
+    setInterviewReady(false)
+    setProctoringState((prev) => ({
+      ...prev,
+      cancelled: true,
+      blocked: true,
+      personCount,
+      lastEventMessage: `Interview cancelled after ${prev.maxWarnings} warnings. Manager has been notified.`,
+    }))
+    setError('Interview cancelled after repeated multi-person camera detections. Manager has been notified.')
+    shutdownCamera()
+  }
+
+  const handleMultiPersonWarning = async (personCount, eventType) => {
+    const current = proctoringStateRef.current
+    if (current.cancelled) return
+    if (isListening && recognitionRef.current) recognitionRef.current.stop()
+    const now = Date.now()
+    if (now < warningCooldownUntilRef.current) return
+    warningCooldownUntilRef.current = now + MULTI_PERSON_WARNING_COOLDOWN_MS
+    const maxWarnings = Number(current.maxWarnings || PROCTORING_MAX_WARNINGS)
+    const nextWarning = Math.min(maxWarnings, Number(current.warningCount || 0) + 1)
+    const action = nextWarning >= maxWarnings ? 'cancel' : 'warn'
+    const response = await reportProctoringEvent({
+      eventType,
+      personCount,
+      warningCount: nextWarning,
+      action,
+    })
+    const warningCount = Number(response?.warningCount || nextWarning)
+    const cancelled = Boolean(response?.cancelled) || warningCount >= maxWarnings
+    setProctoringState((prev) => ({
+      ...prev,
+      warningCount,
+      maxWarnings: Number(response?.maxWarnings || prev.maxWarnings || PROCTORING_MAX_WARNINGS),
+      blocked: true,
+      cancelled,
+      personCount,
+      lastEventMessage: cancelled
+        ? `Interview cancelled after ${warningCount}/${maxWarnings} warnings.`
+        : `Warning ${warningCount}/${maxWarnings}: multiple people detected. Return to single-person frame.`,
+    }))
+    if (cancelled) {
+      await cancelInterviewForPolicy(personCount)
+    }
+  }
+
+  const handleSinglePersonRestored = async (personCount) => {
+    const current = proctoringStateRef.current
+    if (!current.blocked || current.cancelled) return
+    const response = await reportProctoringEvent({
+      eventType: 'single_person_restored',
+      personCount,
+      warningCount: current.warningCount,
+      action: 'clear',
+    })
+    setProctoringState((prev) => ({
+      ...prev,
+      blocked: Boolean(response?.blocked),
+      personCount,
+      lastEventMessage: 'Single-person view restored. Interview resumed.',
+    }))
+  }
+
+  const evaluateCameraFrame = async (eventTypeForWarning) => {
+    if (!interviewReadyRef.current || proctoringStateRef.current.cancelled) return
+    if (detectionBusyRef.current) return
+    detectionBusyRef.current = true
+    try {
+      const personCount = await detectPersonCount()
+      setProctoringState((prev) => ({ ...prev, personCount }))
+      if (personCount > 1) {
+        await handleMultiPersonWarning(personCount, eventTypeForWarning)
+      } else if (personCount === 1) {
+        await handleSinglePersonRestored(personCount)
+      }
+    } finally {
+      detectionBusyRef.current = false
+    }
+  }
+
+  const beginLiveCameraMonitoring = () => {
+    if (!faceDetectionAvailableRef.current) return
+    stopDetectionLoop()
+    detectionIntervalRef.current = window.setInterval(() => {
+      evaluateCameraFrame('live_multi_person_detected')
+    }, 1400)
+  }
+
+  const runCameraPrecheck = async () => {
+    if (!faceDetectionAvailableRef.current) {
+      setCameraError('Advanced multi-person detection is not ready yet. Please retry in a few seconds.')
+      return false
+    }
+    let peakCount = 0
+    let singleFaceSeen = false
+    for (let index = 0; index < 5; index += 1) {
+      const personCount = await detectPersonCount()
+      peakCount = Math.max(peakCount, personCount)
+      if (personCount === 1) singleFaceSeen = true
+      setProctoringState((prev) => ({ ...prev, personCount }))
+      await new Promise((resolve) => window.setTimeout(resolve, 250))
+    }
+    if (peakCount > 1) {
+      await handleMultiPersonWarning(peakCount, 'start_precheck_multi_person')
+      return false
+    }
+    if (!singleFaceSeen) {
+      setCameraError('No clear single face detected. Please face the camera and try again.')
+      return false
+    }
+    return true
+  }
+
+  const handleStartInterview = async () => {
+    if (startingInterview || proctoringStateRef.current.cancelled) return
+    setStartingInterview(true)
+    setError('')
+    const detectorReady = await ensureFaceDetector()
+    if (!detectorReady) {
+      setStartingInterview(false)
+      return
+    }
+    const cameraOk = await ensureCamera()
+    if (!cameraOk) {
+      setStartingInterview(false)
+      return
+    }
+    const precheckPassed = await runCameraPrecheck()
+    if (!precheckPassed) {
+      setStartingInterview(false)
+      return
+    }
+    setInterviewReady(true)
+    if (faceDetectionAvailableRef.current) {
+      setCameraError('')
+    }
+    setProctoringState((prev) => ({
+      ...prev,
+      blocked: false,
+      personCount: prev.personCount || 1,
+      lastEventMessage: 'Camera verified. Interview started in single-person mode.',
+    }))
+    beginLiveCameraMonitoring()
+    setStartingInterview(false)
+  }
+
+  useEffect(() => {
+    return () => {
+      shutdownCamera()
+    }
+  }, [])
+
   const currentDraft = `${draft}${interimTranscript ? `${draft ? ' ' : ''}${interimTranscript}` : ''}`.trim()
   const lastAssistantText = [...messages].reverse().find((item) => item.role === 'assistant')?.text || ''
 
   const toggleListening = () => {
-    if (!speechSupported || !recognitionRef.current || sending || finishing) return
+    if (!speechSupported || !recognitionRef.current || sending || finishing || !interviewReady || proctoringState.blocked || proctoringState.cancelled) return
     if (isListening) recognitionRef.current.stop()
     else recognitionRef.current.start()
   }
@@ -194,7 +553,7 @@ export default function EmployeeInterview() {
 
   const handleSend = async () => {
     const message = currentDraft
-    if (!message || !sessionId || sending || finishing) return
+    if (!message || !sessionId || sending || finishing || !interviewReady || proctoringState.blocked || proctoringState.cancelled) return
     if (isListening && recognitionRef.current) recognitionRef.current.stop()
 
     try {
@@ -213,7 +572,7 @@ export default function EmployeeInterview() {
   }
 
   const handleFinish = async () => {
-    if (!sessionId || finishing) return
+    if (!sessionId || finishing || !interviewReady || proctoringState.blocked || proctoringState.cancelled) return
     try {
       setFinishing(true)
       setError('')
@@ -224,6 +583,8 @@ export default function EmployeeInterview() {
         sessionId,
       })
       setResult(completed)
+      setInterviewReady(false)
+      shutdownCamera()
     } catch (err) {
       setError(err?.message || 'Unable to generate result report right now.')
     } finally {
@@ -289,6 +650,32 @@ export default function EmployeeInterview() {
         </div>
       </div>
 
+      {cameraPermissionRequested && (
+        <div className="fixed right-3 top-20 md:right-5 md:top-24 z-40 w-40 sm:w-48 md:w-56">
+          <div className="rounded-2xl border border-white/15 bg-black/75 backdrop-blur-sm overflow-hidden shadow-2xl">
+            <div className="px-3 py-2 border-b border-white/10 flex items-center justify-between text-xs text-gray-300">
+              <span className="inline-flex items-center gap-1.5"><Camera className="w-3.5 h-3.5" />Camera Monitor</span>
+              <span className={cameraReady ? 'text-emerald-300' : 'text-amber-300'}>
+                {cameraReady
+                  ? faceDetectionMode === 'native'
+                    ? 'Live AI'
+                    : faceDetectionMode === 'fallback'
+                      ? 'Live AI (Fallback)'
+                      : 'Offline'
+                  : 'Offline'}
+              </span>
+            </div>
+            <div className="aspect-square bg-black">
+              <video ref={videoRef} autoPlay muted playsInline className="h-full w-full object-cover" />
+            </div>
+            <div className="px-3 py-2 space-y-1 text-[11px] text-gray-400">
+              <p>People detected: <span className="text-gray-200 font-semibold">{proctoringState.personCount || 0}</span></p>
+              <p>Warnings: <span className="text-amber-300 font-semibold">{proctoringState.warningCount}/{proctoringState.maxWarnings}</span></p>
+            </div>
+          </div>
+        </div>
+      )}
+
       {error && (
         <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300 flex items-center gap-2">
           <AlertTriangle className="w-4 h-4" />
@@ -296,7 +683,60 @@ export default function EmployeeInterview() {
         </div>
       )}
 
+      {(cameraError || proctoringState.lastEventMessage || proctoringState.blocked || proctoringState.cancelled) && (
+        <div
+          className={`rounded-2xl border px-4 py-3 text-sm flex items-center gap-2 ${
+            proctoringState.cancelled
+              ? 'border-red-500/40 bg-red-500/10 text-red-200'
+              : proctoringState.blocked || cameraError
+                ? 'border-amber-500/40 bg-amber-500/10 text-amber-200'
+                : 'border-emerald-500/30 bg-emerald-500/10 text-emerald-200'
+          }`}
+        >
+          <ShieldAlert className="w-4 h-4" />
+          <span>{cameraError || proctoringState.lastEventMessage}</span>
+        </div>
+      )}
+
       {!result ? (
+        !interviewReady ? (
+          <div className="rounded-3xl border border-white/10 bg-black/20 p-6 md:p-8 space-y-5">
+            <div className="inline-flex items-center gap-2 rounded-full border border-white/15 bg-black/30 px-3 py-1.5 text-xs text-gray-300">
+              <ShieldAlert className="w-3.5 h-3.5" />
+              <span>Interview Integrity Check</span>
+            </div>
+            <h2 className="text-2xl font-semibold text-white">Start AI Interview</h2>
+            <p className="text-sm text-gray-400 max-w-2xl">
+              Before starting, we verify a single-person camera frame. If more than one person is detected, a warning is logged to manager notifications and employee status. After 3 warnings, the interview is cancelled automatically.
+            </p>
+            <div className="grid grid-cols-1 md:grid-cols-3 gap-3">
+              <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-gray-500">Warnings</p>
+                <p className="mt-2 text-2xl font-semibold text-amber-300">{proctoringState.warningCount}/{proctoringState.maxWarnings}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-gray-500">People Detected</p>
+                <p className="mt-2 text-2xl font-semibold text-white">{proctoringState.personCount || 0}</p>
+              </div>
+              <div className="rounded-2xl border border-white/10 bg-black/30 p-4">
+                <p className="text-xs uppercase tracking-[0.16em] text-gray-500">Session</p>
+                <p className="mt-2 text-sm font-semibold text-gray-200 break-all">{sessionId || '-'}</p>
+              </div>
+            </div>
+            <button
+              type="button"
+              onClick={handleStartInterview}
+              disabled={startingInterview || proctoringState.cancelled}
+              className="inline-flex items-center gap-2 rounded-xl bg-white text-black px-4 py-2.5 text-sm font-semibold hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
+            >
+              {startingInterview ? <Loader2 className="w-4 h-4 animate-spin" /> : <Camera className="w-4 h-4" />}
+              <span>{startingInterview ? 'Checking Camera...' : 'Start AI Interview'}</span>
+            </button>
+            {proctoringState.cancelled && (
+              <p className="text-sm text-red-300">This interview session is cancelled because the warning limit was reached. Contact your manager to restart with a new session.</p>
+            )}
+          </div>
+        ) : (
         <div className="grid grid-cols-1 xl:grid-cols-[280px_minmax(0,1fr)] gap-4">
           <div className="rounded-3xl border border-white/10 bg-black/20 p-4 md:p-5 space-y-4">
             <div>
@@ -311,7 +751,7 @@ export default function EmployeeInterview() {
               <button
                 type="button"
                 onClick={toggleListening}
-                disabled={!speechSupported || sending || finishing}
+                disabled={!speechSupported || sending || finishing || proctoringState.blocked || proctoringState.cancelled}
                 className={`w-full inline-flex items-center justify-center gap-2 rounded-xl px-3 py-2 text-sm font-semibold transition-colors ${
                   isListening
                     ? 'bg-red-500/20 text-red-300 border border-red-500/40'
@@ -381,6 +821,7 @@ export default function EmployeeInterview() {
               <textarea
                 value={draft}
                 onChange={(event) => setDraft(event.target.value)}
+                disabled={proctoringState.blocked || proctoringState.cancelled}
                 onKeyDown={(event) => {
                   if (event.key === 'Enter' && !event.shiftKey) {
                     event.preventDefault()
@@ -398,7 +839,7 @@ export default function EmployeeInterview() {
                     <button
                       type="button"
                       onClick={handleFinish}
-                      disabled={finishing || sending}
+                      disabled={finishing || sending || proctoringState.blocked || proctoringState.cancelled}
                       className="inline-flex items-center gap-2 rounded-xl border border-emerald-400/30 bg-emerald-500/10 px-3 py-2 text-sm text-emerald-300 hover:bg-emerald-500/20 disabled:opacity-50"
                     >
                       {finishing ? <Loader2 className="w-4 h-4 animate-spin" /> : <CheckCircle2 className="w-4 h-4" />}
@@ -408,7 +849,7 @@ export default function EmployeeInterview() {
                   <button
                     type="button"
                     onClick={handleSend}
-                    disabled={!currentDraft || sending || finishing}
+                    disabled={!currentDraft || sending || finishing || proctoringState.blocked || proctoringState.cancelled}
                     className="inline-flex items-center gap-2 rounded-xl bg-white text-black px-3.5 py-2 text-sm font-semibold hover:bg-gray-200 disabled:opacity-50 disabled:cursor-not-allowed"
                   >
                     {sending ? <Loader2 className="w-4 h-4 animate-spin" /> : <Send className="w-4 h-4" />}
@@ -419,6 +860,7 @@ export default function EmployeeInterview() {
             </div>
           </div>
         </div>
+      )
       ) : (
         <div className="space-y-4">
           <div className="rounded-3xl border border-emerald-500/25 bg-emerald-500/10 p-5">

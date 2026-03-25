@@ -2,6 +2,7 @@ import { useEffect, useState } from 'react'
 import { motion } from 'framer-motion'
 import { PlusCircle, Trash2, Save, AlertTriangle, Pencil, Copy, X, Search } from 'lucide-react'
 import { assessmentEngineService } from '../../api/services/assessmentEngineService'
+import Assessments from './Assessments'
 
 const emptyRubric = { name: '', description: '', competencies: [{ name: '', weight: 1, description: '' }] }
 const emptyTemplate = {
@@ -202,7 +203,7 @@ export default function AssessmentEngine() {
       </div>
 
       <div className="flex gap-2">
-        {['rubrics', 'templates'].map((tab) => (
+        {['rubrics', 'templates', 'records'].map((tab) => (
           <button
             key={tab}
             type="button"
@@ -211,35 +212,37 @@ export default function AssessmentEngine() {
               activeTab === tab ? 'bg-white text-black' : 'bg-white/10 text-gray-200'
             }`}
           >
-            {tab === 'rubrics' ? 'Rubric Templates' : 'Assessment Templates'}
+            {tab === 'rubrics' ? 'Rubric Templates' : tab === 'templates' ? 'Assessment Templates' : 'Records'}
           </button>
         ))}
       </div>
 
-      <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
-        <div className="relative max-w-md w-full">
-          <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
-          <input
-            value={searchQuery}
-            onChange={(e) => setSearchQuery(e.target.value)}
-            placeholder="Search rubrics or templates"
-            className="w-full rounded-xl border border-white/10 bg-black/40 pl-9 pr-3 py-2 text-sm text-white"
-          />
+      {activeTab !== 'records' && (
+        <div className="flex flex-col md:flex-row md:items-center md:justify-between gap-3">
+          <div className="relative max-w-md w-full">
+            <Search className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-500" />
+            <input
+              value={searchQuery}
+              onChange={(e) => setSearchQuery(e.target.value)}
+              placeholder="Search rubrics or templates"
+              className="w-full rounded-xl border border-white/10 bg-black/40 pl-9 pr-3 py-2 text-sm text-white"
+            />
+          </div>
+          {(rubricEditId || templateEditId) && (
+            <button
+              type="button"
+              onClick={() => {
+                resetRubricDraft()
+                resetTemplateDraft()
+              }}
+              className="inline-flex items-center gap-2 text-xs text-gray-300"
+            >
+              <X className="w-4 h-4" />
+              Cancel edit
+            </button>
+          )}
         </div>
-        {(rubricEditId || templateEditId) && (
-          <button
-            type="button"
-            onClick={() => {
-              resetRubricDraft()
-              resetTemplateDraft()
-            }}
-            className="inline-flex items-center gap-2 text-xs text-gray-300"
-          >
-            <X className="w-4 h-4" />
-            Cancel edit
-          </button>
-        )}
-      </div>
+      )}
 
       {error && (
         <div className="rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300 flex items-center gap-2">
@@ -248,7 +251,9 @@ export default function AssessmentEngine() {
         </div>
       )}
 
-      {activeTab === 'rubrics' ? (
+      {activeTab === 'records' ? (
+        <Assessments />
+      ) : activeTab === 'rubrics' ? (
         <div className="grid grid-cols-1 xl:grid-cols-[340px_minmax(0,1fr)] gap-6">
           <div className="rounded-3xl border border-white/10 bg-black/30 p-5 space-y-4">
             <div>
@@ -369,7 +374,7 @@ export default function AssessmentEngine() {
                       onClick={async () => {
                         if (!window.confirm(`Delete rubric "${rubric.name}"?`)) return
                         await assessmentEngineService.deleteRubric(rubric.id)
-                        await refresh()
+                        window.location.reload()
                       }}
                       className="inline-flex items-center gap-1 text-xs text-red-300"
                     >
@@ -597,7 +602,7 @@ export default function AssessmentEngine() {
                       onClick={async () => {
                         if (!window.confirm(`Delete template "${template.title}"?`)) return
                         await assessmentEngineService.deleteTemplate(template.id)
-                        await refresh()
+                        window.location.reload()
                       }}
                       className="inline-flex items-center gap-1 text-xs text-red-300"
                     >

@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 from contextlib import contextmanager
 from copy import deepcopy
+from datetime import UTC, datetime
 from typing import Any
 
 from sqlalchemy import Boolean, Float, Integer, String, Text, create_engine, select, text
@@ -10,7 +11,15 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import DeclarativeBase, Mapped, Session, mapped_column, sessionmaker
 
 from .config import DATABASE_URL
-from .seed_data import DEFAULT_EMPLOYEE_JOURNEY, DEFAULT_SETTINGS, DEFAULT_STORE
+from .seed_data import (
+    DEFAULT_ASSESSMENT_TEMPLATES,
+    DEFAULT_EMPLOYEES,
+    DEFAULT_EMPLOYEE_JOURNEY,
+    DEFAULT_ROLES,
+    DEFAULT_RUBRICS,
+    DEFAULT_SETTINGS,
+    DEFAULT_STORE,
+)
 
 
 class Base(DeclarativeBase):
@@ -67,6 +76,19 @@ class RoleRecord(Base):
     readiness: Mapped[str] = mapped_column(String(64), nullable=False)
     top_gap: Mapped[str] = mapped_column(String(255), nullable=False)
     last_review: Mapped[str] = mapped_column(String(64), nullable=False)
+
+
+class TeamRecord(Base):
+    __tablename__ = "teams"
+    id: Mapped[int] = mapped_column(Integer, primary_key=True, autoincrement=True)
+    name: Mapped[str] = mapped_column(String(255), nullable=False)
+    role_focus: Mapped[str] = mapped_column(String(255), nullable=False, default="")
+    description: Mapped[str] = mapped_column(Text, nullable=False, default="")
+    required_skills_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    member_employee_ids_json: Mapped[str] = mapped_column(Text, nullable=False, default="[]")
+    target_size: Mapped[int] = mapped_column(Integer, nullable=False, default=4)
+    created_at: Mapped[str] = mapped_column(String(64), nullable=False)
+    updated_at: Mapped[str] = mapped_column(String(64), nullable=False)
 
 
 class AssessmentRecord(Base):
@@ -187,10 +209,8 @@ ACTIVE_DATABASE_MODE = "remote"
 
 
 def build_engine(database_url: str):
-    connect_args = {"check_same_thread": False} if database_url.startswith("sqlite") else {}
-    engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True, "connect_args": connect_args}
-    if not database_url.startswith("sqlite"):
-        engine_kwargs.update({"pool_size": 5, "max_overflow": 10, "pool_recycle": 1800})
+    engine_kwargs: dict[str, Any] = {"future": True, "pool_pre_ping": True}
+    engine_kwargs.update({"pool_size": 5, "max_overflow": 10, "pool_recycle": 1800})
     return create_engine(database_url, **engine_kwargs)
 
 
@@ -266,6 +286,112 @@ def seed_if_empty(session: Session, seed: dict[str, Any]) -> None:
     set_state(session, "leaderboard", seed.get("leaderboard", {}))
     set_state(session, "employeeJourney", seed.get("employeeJourney", DEFAULT_EMPLOYEE_JOURNEY))
 
+
+def derive_name_from_email(email: str) -> str:
+    local = str(email or "").split("@", 1)[0].strip()
+    if not local:
+        return "Employee"
+    parts = [token for token in local.replace(".", " ").replace("_", " ").replace("-", " ").split() if token]
+    if not parts:
+        return "Employee"
+    return " ".join(part[:1].upper() + part[1:] for part in parts)
+
+
+def ensure_default_employees(session: Session) -> None:
+    existing_rows = session.scalars(select(EmployeeRecord)).all()
+    known_emails = {str(row.email or "").strip().lower() for row in existing_rows}
+
+    if not existing_rows:
+        for employee in DEFAULT_EMPLOYEES:
+            session.add(
+                EmployeeRecord(
+                    name=employee["name"],
+                    email=employee["email"],
+                    role=employee["role"],
+                    skills_json=dumps_json(employee["skills"]),
+                    skill_level=float(employee["skillLevel"]),
+                    status=employee["status"],
+                    last_assessment=employee["lastAssessment"],
+                )
+            )
+            known_emails.add(str(employee["email"]).strip().lower())
+
+    users = session.scalars(select(UserRecord).where(UserRecord.role == "employee")).all()
+    for user in users:
+        email = str(user.email or "").strip().lower()
+        if not email or email in known_emails:
+            continue
+        session.add(
+            EmployeeRecord(
+                name=user.full_name or derive_name_from_email(user.email),
+                email=user.email,
+                role=f"{user.department or 'General'} Specialist",
+                skills_json=dumps_json([]),
+                skill_level=0.0,
+                status="active",
+                last_assessment="Never",
+            )
+        )
+        known_emails.add(email)
+
+
+def ensure_default_roles(session: Session) -> None:
+    if session.scalar(select(RoleRecord.id).limit(1)) is not None:
+        return
+    for role in DEFAULT_ROLES:
+        session.add(
+            RoleRecord(
+                name=role["name"],
+                required_skills_json=dumps_json(role["requiredSkills"]),
+                employees=int(role["employees"]),
+                avg_score=float(role["avgScore"]),
+                readiness=role["readiness"],
+                top_gap=role["topGap"],
+                last_review=role["lastReview"],
+            )
+        )
+
+
+def ensure_default_rubrics_and_templates(session: Session) -> None:
+    rubrics = session.scalars(select(RubricTemplateRecord).order_by(RubricTemplateRecord.id.asc())).all()
+    now_iso = datetime.now(UTC).isoformat()
+    rubric_id_by_name = {str(row.name): row.id for row in rubrics}
+
+    if not rubrics:
+        for rubric in DEFAULT_RUBRICS:
+            item = RubricTemplateRecord(
+                name=rubric["name"],
+                description=rubric.get("description", ""),
+                competencies_json=dumps_json(rubric.get("competencies", [])),
+                created_at=now_iso,
+            )
+            session.add(item)
+            session.flush()
+            rubric_id_by_name[str(item.name)] = item.id
+
+    if session.scalar(select(AssessmentTemplateRecord.id).limit(1)) is not None:
+        return
+
+    for template in DEFAULT_ASSESSMENT_TEMPLATES:
+        rubric_name = str(template.get("rubricName") or "").strip()
+        session.add(
+            AssessmentTemplateRecord(
+                title=template["title"],
+                description=template.get("description", ""),
+                category=template.get("category", "general"),
+                questions_json=dumps_json(template.get("questions", [])),
+                rubric_id=rubric_id_by_name.get(rubric_name),
+                created_at=now_iso,
+            )
+        )
+
+
+def ensure_baseline_seed_data(session: Session) -> None:
+    ensure_default_employees(session)
+    ensure_default_roles(session)
+    ensure_default_rubrics_and_templates(session)
+
+
 def get_database_mode() -> str:
     return ACTIVE_DATABASE_MODE
 
@@ -274,39 +400,32 @@ def init_database() -> None:
     Base.metadata.create_all(bind=engine)
     ensure_assessment_share_columns()
     ensure_notification_columns()
+    ensure_performance_indexes()
 
     with db_session() as session:
         seed_if_empty(session, deepcopy(DEFAULT_STORE))
+        ensure_baseline_seed_data(session)
 
 
 def ensure_assessment_share_columns() -> None:
     try:
         with engine.begin() as connection:
-            if ACTIVE_DATABASE_URL.startswith("sqlite"):
-                columns = [row[1] for row in connection.execute(text("PRAGMA table_info(assessments)")).fetchall()]
-                if "share_token" not in columns:
-                    connection.execute(text("ALTER TABLE assessments ADD COLUMN share_token VARCHAR(80)"))
-                if "share_enabled" not in columns:
-                    connection.execute(text("ALTER TABLE assessments ADD COLUMN share_enabled BOOLEAN NOT NULL DEFAULT 0"))
-                if "share_created_at" not in columns:
-                    connection.execute(text("ALTER TABLE assessments ADD COLUMN share_created_at VARCHAR(64)"))
-            else:
-                result = connection.execute(
-                    text(
-                        """
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_name='assessments'
-                        """
-                    )
-                ).fetchall()
-                columns = {row[0] for row in result}
-                if "share_token" not in columns:
-                    connection.execute(text("ALTER TABLE assessments ADD COLUMN share_token VARCHAR(80)"))
-                if "share_enabled" not in columns:
-                    connection.execute(text("ALTER TABLE assessments ADD COLUMN share_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
-                if "share_created_at" not in columns:
-                    connection.execute(text("ALTER TABLE assessments ADD COLUMN share_created_at VARCHAR(64)"))
+            result = connection.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name='assessments'
+                    """
+                )
+            ).fetchall()
+            columns = {row[0] for row in result}
+            if "share_token" not in columns:
+                connection.execute(text("ALTER TABLE assessments ADD COLUMN share_token VARCHAR(80)"))
+            if "share_enabled" not in columns:
+                connection.execute(text("ALTER TABLE assessments ADD COLUMN share_enabled BOOLEAN NOT NULL DEFAULT FALSE"))
+            if "share_created_at" not in columns:
+                connection.execute(text("ALTER TABLE assessments ADD COLUMN share_created_at VARCHAR(64)"))
     except SQLAlchemyError:
         return
 
@@ -314,30 +433,47 @@ def ensure_assessment_share_columns() -> None:
 def ensure_notification_columns() -> None:
     try:
         with engine.begin() as connection:
-            if ACTIVE_DATABASE_URL.startswith("sqlite"):
-                columns = [row[1] for row in connection.execute(text("PRAGMA table_info(notifications)")).fetchall()]
-                if "user_id" not in columns:
-                    connection.execute(text("ALTER TABLE notifications ADD COLUMN user_id VARCHAR(80)"))
-                if "created_at" not in columns:
-                    connection.execute(text("ALTER TABLE notifications ADD COLUMN created_at VARCHAR(64)"))
-                if "category" not in columns:
-                    connection.execute(text("ALTER TABLE notifications ADD COLUMN category VARCHAR(32)"))
-            else:
-                result = connection.execute(
-                    text(
-                        """
-                        SELECT column_name
-                        FROM information_schema.columns
-                        WHERE table_name='notifications'
-                        """
-                    )
-                ).fetchall()
-                columns = {row[0] for row in result}
-                if "user_id" not in columns:
-                    connection.execute(text("ALTER TABLE notifications ADD COLUMN user_id VARCHAR(80)"))
-                if "created_at" not in columns:
-                    connection.execute(text("ALTER TABLE notifications ADD COLUMN created_at VARCHAR(64)"))
-                if "category" not in columns:
-                    connection.execute(text("ALTER TABLE notifications ADD COLUMN category VARCHAR(32)"))
+            result = connection.execute(
+                text(
+                    """
+                    SELECT column_name
+                    FROM information_schema.columns
+                    WHERE table_name='notifications'
+                    """
+                )
+            ).fetchall()
+            columns = {row[0] for row in result}
+            if "user_id" not in columns:
+                connection.execute(text("ALTER TABLE notifications ADD COLUMN user_id VARCHAR(80)"))
+            if "created_at" not in columns:
+                connection.execute(text("ALTER TABLE notifications ADD COLUMN created_at VARCHAR(64)"))
+            if "category" not in columns:
+                connection.execute(text("ALTER TABLE notifications ADD COLUMN category VARCHAR(32)"))
+    except SQLAlchemyError:
+        return
+
+
+def ensure_performance_indexes() -> None:
+    statements = [
+        "CREATE INDEX IF NOT EXISTS idx_users_role ON users (role)",
+        "CREATE INDEX IF NOT EXISTS idx_users_email ON users (email)",
+        "CREATE INDEX IF NOT EXISTS idx_employees_email ON employees (email)",
+        "CREATE INDEX IF NOT EXISTS idx_employees_role ON employees (role)",
+        "CREATE INDEX IF NOT EXISTS idx_assessments_employee_id ON assessments (employee_id)",
+        "CREATE INDEX IF NOT EXISTS idx_assessments_date ON assessments (date)",
+        "CREATE INDEX IF NOT EXISTS idx_assessments_employee_date ON assessments (employee_id, date)",
+        "CREATE INDEX IF NOT EXISTS idx_manager_schedules_employee ON manager_interview_schedules (employee_id)",
+        "CREATE INDEX IF NOT EXISTS idx_manager_schedules_created ON manager_interview_schedules (created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_manager_comms_employee ON manager_communications (employee_id)",
+        "CREATE INDEX IF NOT EXISTS idx_manager_comms_created ON manager_communications (created_at)",
+        "CREATE INDEX IF NOT EXISTS idx_assessment_attempts_employee ON assessment_attempts (employee_id)",
+        "CREATE INDEX IF NOT EXISTS idx_feedback_surveys_employee ON feedback_surveys (employee_id)",
+        "CREATE INDEX IF NOT EXISTS idx_notifications_user ON notifications (user_id)",
+        "CREATE INDEX IF NOT EXISTS idx_teams_name ON teams (name)",
+    ]
+    try:
+        with engine.begin() as connection:
+            for statement in statements:
+                connection.execute(text(statement))
     except SQLAlchemyError:
         return
