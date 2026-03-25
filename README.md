@@ -132,9 +132,12 @@ Exportable Analytics: Comprehensive PDF/CSV reports for hiring compliance and di
 🔐 Demo Credentials
 (Provide these if the project is being reviewed by judges)
 
-Manager Portal Login: manager@skillsense.ai / password123
+Manager Portal Login: manager@skillsense.ai / manager123
 
-Employee/Candidate Portal Login: candidate@skillsense.ai / password123
+Employee/Candidate Portal Login: candidate@skillsense.ai / employee123
 
 🌟 Why It Stands Out
 Unlike simple resume analyzers that stop at data extraction, SkillSenseAI is a comprehensive operational tool. It seamlessly combines deep candidate analysis, interview intelligence, manager operations, scheduling, and multi-channel communication into one explainable AI workflow. We aren't just summarizing text; we are accelerating the human decision-making process.
+
+
+ MADE BY: AayanKarasu
