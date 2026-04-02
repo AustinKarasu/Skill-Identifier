@@ -140,4 +140,5 @@ Employee/Candidate Portal Login: candidate@skillsense.ai / employee123
 Unlike simple resume analyzers that stop at data extraction, SkillSenseAI is a comprehensive operational tool. It seamlessly combines deep candidate analysis, interview intelligence, manager operations, scheduling, and multi-channel communication into one explainable AI workflow. We aren't just summarizing text; we are accelerating the human decision-making process.
 
 
- MADE BY: AayanKarasu
+ MADE BY: AayanKarasu 
+ FREE .env credinatls to test the system without worrying about api's
