@@ -1,4 +1,3 @@
-Here is a polished, professional version of your project description. It is formatted in clean Markdown, making it perfect to copy and paste directly into a GitHub README.md, a Devpost hackathon submission, or a product portfolio.
 
 🚀 SkillSenseAI
 SkillSenseAI is an AI-powered hiring and talent operations platform that analyzes resumes, matches candidates to job descriptions, supports interview workflows, and gives managers actionable decision tools.
